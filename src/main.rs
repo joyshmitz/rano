@@ -1,0 +1,2622 @@
+use libc;
+use rusqlite::{params, Connection};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::env;
+use std::ffi::CStr;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static RUNNING: AtomicBool = AtomicBool::new(true);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorMode {
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DomainMode {
+    Auto,
+    Ptr,
+    Pcap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogFormat {
+    Auto,
+    Pretty,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Theme {
+    Vivid,
+    Mono,
+}
+
+
+struct Cli {
+    command: Option<Command>,
+    monitor: MonitorArgs,
+}
+
+enum Command {
+    Update(UpdateCommand),
+}
+
+#[derive(Clone, Debug)]
+struct MonitorArgs {
+    patterns: Vec<String>,
+    exclude_patterns: Vec<String>,
+    pids: Vec<u32>,
+    no_descendants: bool,
+    interval_ms: u64,
+    json: bool,
+    summary_only: bool,
+    domain_mode: DomainMode,
+    pcap: bool,
+    no_dns: bool,
+    include_udp: bool,
+    include_listening: bool,
+    log_file: Option<PathBuf>,
+    log_dir: Option<PathBuf>,
+    log_format: LogFormat,
+    once: bool,
+    color: ColorMode,
+    sqlite_path: String,
+    no_sqlite: bool,
+    stats_interval_ms: u64,
+    stats_width: usize,
+    stats_top: usize,
+    no_banner: bool,
+    theme: Theme,
+}
+
+impl Default for MonitorArgs {
+    fn default() -> Self {
+        Self {
+            patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            pids: Vec::new(),
+            no_descendants: false,
+            interval_ms: 1000,
+            json: false,
+            summary_only: false,
+            domain_mode: DomainMode::Auto,
+            pcap: false,
+            no_dns: false,
+            include_udp: true,
+            include_listening: false,
+            log_file: None,
+            log_dir: None,
+            log_format: LogFormat::Auto,
+            once: false,
+            color: ColorMode::Auto,
+            sqlite_path: "observer.sqlite".to_string(),
+            no_sqlite: false,
+            stats_interval_ms: 5000,
+            stats_width: 40,
+            stats_top: 5,
+            no_banner: false,
+            theme: Theme::Vivid,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct UpdateCommand {
+    version: Option<String>,
+    system: bool,
+    easy_mode: bool,
+    dest: Option<PathBuf>,
+    from_source: bool,
+    verify: bool,
+    quiet: bool,
+    no_gum: bool,
+    owner: Option<String>,
+    repo: Option<String>,
+    branch: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum Proto {
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct ConnKey {
+    proto: Proto,
+    local_ip: IpAddr,
+    local_port: u16,
+    remote_ip: IpAddr,
+    remote_port: u16,
+}
+
+#[derive(Clone, Debug)]
+struct ConnInfo {
+    pid: u32,
+    comm: String,
+    cmdline: String,
+    provider: Provider,
+    domain: Option<String>,
+    opened_at: SystemTime,
+    last_seen: SystemTime,
+}
+
+#[derive(Clone, Debug)]
+struct NetEntry {
+    local_ip: IpAddr,
+    local_port: u16,
+    remote_ip: IpAddr,
+    remote_port: u16,
+    inode: u64,
+    state: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+enum Provider {
+    Anthropic,
+    OpenAI,
+    Google,
+    Unknown,
+}
+
+impl Provider {
+    fn label(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "anthropic",
+            Provider::OpenAI => "openai",
+            Provider::Google => "google",
+            Provider::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Default)]
+struct Stats {
+    connects: u64,
+    closes: u64,
+    active: u64,
+    peak_active: u64,
+    per_ip: BTreeMap<IpAddr, u64>,
+    per_domain: BTreeMap<String, u64>,
+    per_pid: BTreeMap<u32, u64>,
+    per_comm: BTreeMap<String, u64>,
+    per_provider: BTreeMap<Provider, u64>,
+    per_provider_domains: BTreeMap<Provider, HashSet<String>>,
+    per_provider_ips: BTreeMap<Provider, HashSet<IpAddr>>,
+    duration_ms_total: u64,
+    duration_ms_max: u64,
+    duration_ms_samples: u64,
+}
+
+struct RunContext {
+    run_id: String,
+    start_ts: String,
+    host: String,
+    user: String,
+    patterns: String,
+    domain_label: String,
+    args_snapshot: String,
+    interval_ms: u64,
+    stats_interval_ms: u64,
+}
+
+impl RunContext {
+    fn new(args: &MonitorArgs, domain_label: &str) -> Self {
+        let start_ts = now_rfc3339();
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let run_id = format!("{}-{}", std::process::id(), millis);
+        let host = hostname();
+        let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+        let args_snapshot = env::args().collect::<Vec<_>>().join(" ");
+        let patterns = args.patterns.join(", ");
+        Self {
+            run_id,
+            start_ts,
+            host,
+            user,
+            patterns,
+            domain_label: domain_label.to_string(),
+            args_snapshot,
+            interval_ms: args.interval_ms,
+            stats_interval_ms: args.stats_interval_ms,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum AnsiColor {
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightBlack,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
+}
+
+impl AnsiColor {
+    fn code(self) -> &'static str {
+        match self {
+            AnsiColor::Red => "31",
+            AnsiColor::Green => "32",
+            AnsiColor::Yellow => "33",
+            AnsiColor::Blue => "34",
+            AnsiColor::Magenta => "35",
+            AnsiColor::Cyan => "36",
+            AnsiColor::White => "37",
+            AnsiColor::BrightBlack => "90",
+            AnsiColor::BrightRed => "91",
+            AnsiColor::BrightGreen => "92",
+            AnsiColor::BrightYellow => "93",
+            AnsiColor::BrightBlue => "94",
+            AnsiColor::BrightMagenta => "95",
+            AnsiColor::BrightCyan => "96",
+            AnsiColor::BrightWhite => "97",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutputStyle {
+    color: bool,
+    theme: Theme,
+}
+
+impl OutputStyle {
+    fn provider_color(self, provider: Provider) -> Option<AnsiColor> {
+        if !self.color || self.theme == Theme::Mono {
+            return None;
+        }
+        Some(match provider {
+            Provider::Anthropic => AnsiColor::Magenta,
+            Provider::OpenAI => AnsiColor::BrightGreen,
+            Provider::Google => AnsiColor::BrightBlue,
+            Provider::Unknown => AnsiColor::BrightBlack,
+        })
+    }
+
+    fn event_color(self, event: &str) -> Option<AnsiColor> {
+        if !self.color || self.theme == Theme::Mono {
+            return None;
+        }
+        match event {
+            "connect" => Some(AnsiColor::BrightGreen),
+            "close" => Some(AnsiColor::BrightYellow),
+            _ => Some(AnsiColor::BrightWhite),
+        }
+    }
+
+    fn accent(self) -> Option<AnsiColor> {
+        if !self.color || self.theme == Theme::Mono {
+            return None;
+        }
+        Some(AnsiColor::BrightCyan)
+    }
+}
+
+struct LogWriter {
+    file: Mutex<std::fs::File>,
+    format: LogFormat,
+}
+
+impl LogWriter {
+    fn write_line(&self, line: &str) {
+        if let Ok(mut file) = self.file.lock() {
+            let _ = writeln!(file, "{}", line);
+        }
+    }
+}
+
+struct DnsCacheEntry {
+    value: Option<String>,
+    stored_at: SystemTime,
+}
+
+fn main() {
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("error: {}", err);
+            eprintln!("Run `rano --help` for usage.");
+            std::process::exit(1);
+        }
+    };
+
+    if let Some(Command::Update(update)) = cli.command {
+        if let Err(err) = self_update(update) {
+            eprintln!("rano update failed: {}", err);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let mut args = cli.monitor;
+    if args.pcap {
+        args.domain_mode = DomainMode::Pcap;
+    }
+    if args.patterns.is_empty() && args.pids.is_empty() {
+        args.patterns = default_patterns();
+    }
+
+    let color_enabled = resolve_color_mode(args.color);
+    let style = OutputStyle {
+        color: color_enabled,
+        theme: args.theme,
+    };
+
+    let (domain_mode, domain_note) = resolve_domain_mode(&args);
+    let mut domain_notes: Vec<String> = Vec::new();
+    if let Some(note) = domain_note {
+        domain_notes.push(note);
+    }
+    if args.no_dns && domain_mode == DomainMode::Ptr {
+        domain_notes.push("PTR lookups disabled (--no-dns); domains will be unknown.".to_string());
+    }
+    let domain_note = if domain_notes.is_empty() {
+        None
+    } else {
+        Some(domain_notes.join(" "))
+    };
+    let ptr_enabled = domain_mode == DomainMode::Ptr && !args.no_dns;
+    let domain_label = if domain_mode == DomainMode::Pcap {
+        "pcap"
+    } else if ptr_enabled {
+        "ptr"
+    } else {
+        "disabled"
+    };
+
+    setup_signal_handler();
+
+    let mut dns_cache: HashMap<IpAddr, DnsCacheEntry> = HashMap::new();
+
+    let mut active: HashMap<ConnKey, ConnInfo> = HashMap::new();
+    let mut stats = Stats::default();
+
+    let log_writer = open_log_writer(&args, &domain_label);
+    let log_format = log_writer.as_ref().map(|w| w.format).unwrap_or(LogFormat::Auto);
+
+    let sqlite = if args.no_sqlite {
+        None
+    } else {
+        let conn = Connection::open(&args.sqlite_path).ok();
+        conn.map(|c| Arc::new(Mutex::new(c)))
+    };
+
+    let run_ctx = RunContext::new(&args, domain_label);
+
+    if let Some(conn) = sqlite.as_ref() {
+        if let Ok(mut c) = conn.lock() {
+            let _ = init_sqlite(&mut c);
+            let _ = insert_session(&mut c, &run_ctx);
+        }
+    }
+
+    if !args.no_banner {
+        banner(&args, domain_label, domain_note.as_deref(), style, &log_writer);
+    }
+
+    let mut last_stats = SystemTime::now();
+
+    loop {
+        if !RUNNING.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let roots = find_root_pids(&args.patterns, &args.exclude_patterns, &args.pids);
+        let targets = if args.no_descendants {
+            roots.iter().copied().collect::<HashSet<_>>()
+        } else {
+            collect_descendants(&roots)
+        };
+        let inode_to_pid = map_inodes(&targets);
+        let pid_meta = build_pid_meta_map(&targets);
+
+        let mut seen_keys: HashSet<ConnKey> = HashSet::new();
+        let entries = gather_net_entries(args.include_udp);
+        let now = SystemTime::now();
+
+        for (proto, entry) in entries {
+            if entry.remote_port == 0 {
+                continue;
+            }
+            if !args.include_listening && entry.state == "0A" && proto == Proto::Tcp {
+                continue;
+            }
+
+            let pid = match inode_to_pid.get(&entry.inode) {
+                Some(pid) => *pid,
+                None => continue,
+            };
+            if !targets.contains(&pid) {
+                continue;
+            }
+
+            let key = ConnKey {
+                proto,
+                local_ip: entry.local_ip,
+                local_port: entry.local_port,
+                remote_ip: entry.remote_ip,
+                remote_port: entry.remote_port,
+            };
+
+            seen_keys.insert(key.clone());
+
+            if !active.contains_key(&key) {
+                let domain = if ptr_enabled {
+                    resolve_domain(entry.remote_ip, &mut dns_cache)
+                } else {
+                    None
+                };
+                let meta = pid_meta.get(&pid).cloned().unwrap_or_else(|| PidMeta {
+                    comm: "unknown".to_string(),
+                    cmdline: "".to_string(),
+                    provider: Provider::Unknown,
+                });
+
+                let info = ConnInfo {
+                    pid,
+                    comm: meta.comm.clone(),
+                    cmdline: meta.cmdline.clone(),
+                    provider: meta.provider,
+                    domain: domain.clone(),
+                    opened_at: now,
+                    last_seen: now,
+                };
+                active.insert(key.clone(), info);
+
+                if !args.summary_only {
+                    emit_event(
+                        "connect",
+                        &run_ctx.run_id,
+                        &key,
+                        pid,
+                        &meta.comm,
+                        &meta.cmdline,
+                        meta.provider,
+                        domain.as_deref(),
+                        None,
+                        args.json,
+                        style,
+                        log_format_for_output(args.json, log_format),
+                        log_writer.as_ref(),
+                        sqlite.as_ref(),
+                    );
+                } else if let Some(conn) = sqlite.as_ref() {
+                    if let Ok(mut c) = conn.lock() {
+                        let _ = log_sqlite(
+                            &mut c,
+                            "connect",
+                            &run_ctx.run_id,
+                            &key,
+                            pid,
+                            &meta.comm,
+                            &meta.cmdline,
+                            meta.provider,
+                            domain.as_deref(),
+                            None,
+                        );
+                    }
+                }
+
+                stats.connects += 1;
+                stats.active = stats.active.saturating_add(1);
+                stats.peak_active = stats.peak_active.max(stats.active);
+                *stats.per_ip.entry(entry.remote_ip).or_insert(0) += 1;
+                *stats.per_pid.entry(pid).or_insert(0) += 1;
+                *stats.per_comm.entry(meta.comm.clone()).or_insert(0) += 1;
+                *stats.per_provider.entry(meta.provider).or_insert(0) += 1;
+                stats
+                    .per_provider_domains
+                    .entry(meta.provider)
+                    .or_default()
+                    .extend(domain.iter().cloned());
+                stats
+                    .per_provider_ips
+                    .entry(meta.provider)
+                    .or_default()
+                    .insert(entry.remote_ip);
+                if let Some(name) = domain {
+                    *stats.per_domain.entry(name).or_insert(0) += 1;
+                }
+            } else if let Some(info) = active.get_mut(&key) {
+                info.last_seen = now;
+            }
+        }
+
+        let stale_keys: Vec<ConnKey> = active
+            .keys()
+            .filter(|k| !seen_keys.contains(*k))
+            .cloned()
+            .collect();
+        for key in stale_keys {
+            if let Some(info) = active.remove(&key) {
+                let duration_ms = now
+                    .duration_since(info.opened_at)
+                    .map(|d| d.as_millis() as u64)
+                    .ok();
+                if !args.summary_only {
+                    emit_event(
+                        "close",
+                        &run_ctx.run_id,
+                        &key,
+                        info.pid,
+                        &info.comm,
+                        &info.cmdline,
+                        info.provider,
+                        info.domain.as_deref(),
+                        duration_ms,
+                        args.json,
+                        style,
+                        log_format_for_output(args.json, log_format),
+                        log_writer.as_ref(),
+                        sqlite.as_ref(),
+                    );
+                } else if let Some(conn) = sqlite.as_ref() {
+                    if let Ok(mut c) = conn.lock() {
+                        let _ = log_sqlite(
+                            &mut c,
+                            "close",
+                            &run_ctx.run_id,
+                            &key,
+                            info.pid,
+                            &info.comm,
+                            &info.cmdline,
+                            info.provider,
+                            info.domain.as_deref(),
+                            duration_ms,
+                        );
+                    }
+                }
+                stats.closes += 1;
+                stats.active = stats.active.saturating_sub(1);
+                if let Some(ms) = duration_ms {
+                    stats.duration_ms_samples += 1;
+                    stats.duration_ms_total = stats.duration_ms_total.saturating_add(ms);
+                    stats.duration_ms_max = stats.duration_ms_max.max(ms);
+                }
+            }
+        }
+
+        if args.stats_interval_ms > 0 && !args.json {
+            if let Ok(elapsed) = now.duration_since(last_stats) {
+                if elapsed >= Duration::from_millis(args.stats_interval_ms) {
+                    print_stats(&stats, args.stats_width, args.stats_top, style);
+                    last_stats = now;
+                }
+            }
+        }
+
+        if args.once {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(args.interval_ms));
+    }
+
+    if let Some(conn) = sqlite.as_ref() {
+        if let Ok(mut c) = conn.lock() {
+            let _ = finalize_session(&mut c, &run_ctx, &stats);
+        }
+    }
+
+    summary(&stats, args.json, args.stats_top, style, log_writer.as_ref());
+}
+
+fn parse_cli() -> Result<Cli, String> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() <= 1 {
+        return Ok(Cli {
+            command: None,
+            monitor: load_monitor_args(&[])? ,
+        });
+    }
+
+    match args[1].as_str() {
+        "-h" | "--help" => {
+            print_help();
+            std::process::exit(0);
+        }
+        "-V" | "--version" => {
+            print_version();
+            std::process::exit(0);
+        }
+        "update" => {
+            let update = parse_update_args(&args[2..])?;
+            Ok(Cli {
+                command: Some(Command::Update(update)),
+                monitor: MonitorArgs::default(),
+            })
+        }
+        _ => Ok(Cli {
+            command: None,
+            monitor: load_monitor_args(&args[1..])?,
+        }),
+    }
+}
+
+fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
+    for arg in argv {
+        if arg == "-h" || arg == "--help" {
+            print_help();
+            std::process::exit(0);
+        }
+        if arg == "-V" || arg == "--version" {
+            print_version();
+            std::process::exit(0);
+        }
+    }
+
+    let (config_path, use_config) = find_config_flag(argv);
+    let mut args = MonitorArgs::default();
+    if use_config {
+        if let Some(path) = config_path.or_else(default_config_path) {
+            if path.exists() {
+                apply_config_file(&path, &mut args)?;
+            }
+        }
+    }
+
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        match arg.as_str() {
+            "--pattern" => {
+                i += 1;
+                let value = require_value(argv, i, "--pattern")?;
+                args.patterns.push(value.to_string());
+                i += 1;
+            }
+            "--exclude-pattern" => {
+                i += 1;
+                let value = require_value(argv, i, "--exclude-pattern")?;
+                args.exclude_patterns.push(value.to_string());
+                i += 1;
+            }
+            "--pid" => {
+                i += 1;
+                let value = require_value(argv, i, "--pid")?;
+                let pid = value.parse::<u32>().map_err(|_| "Invalid --pid value".to_string())?;
+                args.pids.push(pid);
+                i += 1;
+            }
+            "--no-descendants" => {
+                args.no_descendants = true;
+                i += 1;
+            }
+            "--interval-ms" => {
+                i += 1;
+                let value = require_value(argv, i, "--interval-ms")?;
+                args.interval_ms = parse_u64(value, "--interval-ms")?;
+                i += 1;
+            }
+            "--json" => {
+                args.json = true;
+                i += 1;
+            }
+            "--summary-only" => {
+                args.summary_only = true;
+                i += 1;
+            }
+            "--domain-mode" => {
+                i += 1;
+                let value = require_value(argv, i, "--domain-mode")?;
+                args.domain_mode = parse_domain_mode(value)?;
+                i += 1;
+            }
+            "--pcap" => {
+                args.pcap = true;
+                i += 1;
+            }
+            "--no-dns" => {
+                args.no_dns = true;
+                i += 1;
+            }
+            "--include-udp" => {
+                args.include_udp = true;
+                i += 1;
+            }
+            "--no-udp" => {
+                args.include_udp = false;
+                i += 1;
+            }
+            "--include-listening" => {
+                args.include_listening = true;
+                i += 1;
+            }
+            "--log-file" => {
+                i += 1;
+                let value = require_value(argv, i, "--log-file")?;
+                args.log_file = Some(PathBuf::from(value));
+                i += 1;
+            }
+            "--log-dir" => {
+                i += 1;
+                let value = require_value(argv, i, "--log-dir")?;
+                args.log_dir = Some(PathBuf::from(value));
+                i += 1;
+            }
+            "--log-format" => {
+                i += 1;
+                let value = require_value(argv, i, "--log-format")?;
+                args.log_format = parse_log_format(value)?;
+                i += 1;
+            }
+            "--once" => {
+                args.once = true;
+                i += 1;
+            }
+            "--color" => {
+                i += 1;
+                let value = require_value(argv, i, "--color")?;
+                args.color = parse_color_mode(value)?;
+                i += 1;
+            }
+            "--no-color" => {
+                args.color = ColorMode::Never;
+                i += 1;
+            }
+            "--sqlite" => {
+                i += 1;
+                let value = require_value(argv, i, "--sqlite")?;
+                args.sqlite_path = value.to_string();
+                i += 1;
+            }
+            "--no-sqlite" => {
+                args.no_sqlite = true;
+                i += 1;
+            }
+            "--stats-interval-ms" => {
+                i += 1;
+                let value = require_value(argv, i, "--stats-interval-ms")?;
+                args.stats_interval_ms = parse_u64(value, "--stats-interval-ms")?;
+                i += 1;
+            }
+            "--stats-width" => {
+                i += 1;
+                let value = require_value(argv, i, "--stats-width")?;
+                args.stats_width = parse_usize(value, "--stats-width")?;
+                i += 1;
+            }
+            "--stats-top" => {
+                i += 1;
+                let value = require_value(argv, i, "--stats-top")?;
+                args.stats_top = parse_usize(value, "--stats-top")?;
+                if args.stats_top == 0 {
+                    return Err("--stats-top must be >= 1".to_string());
+                }
+                i += 1;
+            }
+            "--no-banner" => {
+                args.no_banner = true;
+                i += 1;
+            }
+            "--theme" => {
+                i += 1;
+                let value = require_value(argv, i, "--theme")?;
+                args.theme = parse_theme(value)?;
+                i += 1;
+            }
+            "--config" => {
+                i += 2;
+            }
+            "--no-config" => {
+                i += 1;
+            }
+            other => {
+                if other.starts_with('-') {
+                    return Err(format!("Unknown flag: {}", other));
+                }
+                return Err(format!("Unexpected argument: {}", other));
+            }
+        }
+    }
+
+    if args.stats_top == 0 {
+        args.stats_top = 1;
+    }
+
+    Ok(args)
+}
+
+fn parse_update_args(argv: &[String]) -> Result<UpdateCommand, String> {
+    for arg in argv {
+        if arg == "-h" || arg == "--help" {
+            print_update_help();
+            std::process::exit(0);
+        }
+        if arg == "-V" || arg == "--version" {
+            print_version();
+            std::process::exit(0);
+        }
+    }
+
+    let mut cmd = UpdateCommand {
+        version: None,
+        system: false,
+        easy_mode: false,
+        dest: None,
+        from_source: false,
+        verify: false,
+        quiet: false,
+        no_gum: false,
+        owner: None,
+        repo: None,
+        branch: None,
+    };
+
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        match arg.as_str() {
+            "--version" => {
+                i += 1;
+                let value = require_value(argv, i, "--version")?;
+                cmd.version = Some(value.to_string());
+                i += 1;
+            }
+            "--system" => {
+                cmd.system = true;
+                i += 1;
+            }
+            "--easy-mode" => {
+                cmd.easy_mode = true;
+                i += 1;
+            }
+            "--dest" => {
+                i += 1;
+                let value = require_value(argv, i, "--dest")?;
+                cmd.dest = Some(PathBuf::from(value));
+                i += 1;
+            }
+            "--from-source" => {
+                cmd.from_source = true;
+                i += 1;
+            }
+            "--verify" => {
+                cmd.verify = true;
+                i += 1;
+            }
+            "--quiet" => {
+                cmd.quiet = true;
+                i += 1;
+            }
+            "--no-gum" => {
+                cmd.no_gum = true;
+                i += 1;
+            }
+            "--owner" => {
+                i += 1;
+                let value = require_value(argv, i, "--owner")?;
+                cmd.owner = Some(value.to_string());
+                i += 1;
+            }
+            "--repo" => {
+                i += 1;
+                let value = require_value(argv, i, "--repo")?;
+                cmd.repo = Some(value.to_string());
+                i += 1;
+            }
+            "--branch" => {
+                i += 1;
+                let value = require_value(argv, i, "--branch")?;
+                cmd.branch = Some(value.to_string());
+                i += 1;
+            }
+            other => {
+                if other.starts_with('-') {
+                    return Err(format!("Unknown update flag: {}", other));
+                }
+                return Err(format!("Unexpected update argument: {}", other));
+            }
+        }
+    }
+
+    Ok(cmd)
+}
+
+fn require_value<'a>(argv: &'a [String], index: usize, flag: &str) -> Result<&'a str, String> {
+    argv.get(index)
+        .map(|v| v.as_str())
+        .ok_or_else(|| format!("Missing value for {}", flag))
+}
+
+fn parse_u64(value: &str, flag: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("Invalid value for {}", flag))
+}
+
+fn parse_usize(value: &str, flag: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("Invalid value for {}", flag))
+}
+
+fn parse_domain_mode(value: &str) -> Result<DomainMode, String> {
+    match value.to_lowercase().as_str() {
+        "auto" => Ok(DomainMode::Auto),
+        "ptr" => Ok(DomainMode::Ptr),
+        "pcap" => Ok(DomainMode::Pcap),
+        _ => Err("Invalid --domain-mode (use auto|ptr|pcap)".to_string()),
+    }
+}
+
+fn parse_color_mode(value: &str) -> Result<ColorMode, String> {
+    match value.to_lowercase().as_str() {
+        "auto" => Ok(ColorMode::Auto),
+        "always" => Ok(ColorMode::Always),
+        "never" => Ok(ColorMode::Never),
+        _ => Err("Invalid --color (use auto|always|never)".to_string()),
+    }
+}
+
+fn parse_log_format(value: &str) -> Result<LogFormat, String> {
+    match value.to_lowercase().as_str() {
+        "auto" => Ok(LogFormat::Auto),
+        "pretty" => Ok(LogFormat::Pretty),
+        "json" => Ok(LogFormat::Json),
+        _ => Err("Invalid --log-format (use auto|pretty|json)".to_string()),
+    }
+}
+
+fn parse_theme(value: &str) -> Result<Theme, String> {
+    match value.to_lowercase().as_str() {
+        "vivid" => Ok(Theme::Vivid),
+        "mono" => Ok(Theme::Mono),
+        _ => Err("Invalid --theme (use vivid|mono)".to_string()),
+    }
+}
+
+fn find_config_flag(argv: &[String]) -> (Option<PathBuf>, bool) {
+    let mut config_path = None;
+    let mut use_config = true;
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--config" => {
+                if let Some(path) = argv.get(i + 1) {
+                    config_path = Some(PathBuf::from(path));
+                }
+                i += 2;
+            }
+            "--no-config" => {
+                use_config = false;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    (config_path, use_config)
+}
+
+fn default_config_path() -> Option<PathBuf> {
+    let home = env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/rano/config.conf"))
+}
+
+fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read config {}: {}", path.display(), e))?;
+    for (idx, line) in contents.lines().enumerate() {
+        let raw = line.split('#').next().unwrap_or("").trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let mut parts = raw.splitn(2, '=');
+        let key = parts.next().unwrap_or("").trim();
+        let value = parts.next().unwrap_or("").trim();
+        if key.is_empty() {
+            continue;
+        }
+        if value.is_empty() {
+            return Err(format!(
+                "Config parse error at line {}: missing value for '{}'",
+                idx + 1,
+                key
+            ));
+        }
+        match key {
+            "pattern" => push_list_value(&mut args.patterns, value),
+            "exclude_pattern" => push_list_value(&mut args.exclude_patterns, value),
+            "pid" => {
+                let pid = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid pid at line {}", idx + 1))?;
+                args.pids.push(pid);
+            }
+            "no_descendants" => args.no_descendants = parse_bool(value)?,
+            "interval_ms" => args.interval_ms = parse_u64(value, "interval_ms")?,
+            "json" => args.json = parse_bool(value)?,
+            "summary_only" => args.summary_only = parse_bool(value)?,
+            "domain_mode" => args.domain_mode = parse_domain_mode(value)?,
+            "pcap" => args.pcap = parse_bool(value)?,
+            "no_dns" => args.no_dns = parse_bool(value)?,
+            "include_udp" => args.include_udp = parse_bool(value)?,
+            "include_listening" => args.include_listening = parse_bool(value)?,
+            "log_file" => args.log_file = Some(PathBuf::from(value)),
+            "log_dir" => args.log_dir = Some(PathBuf::from(value)),
+            "log_format" => args.log_format = parse_log_format(value)?,
+            "once" => args.once = parse_bool(value)?,
+            "color" => args.color = parse_color_mode(value)?,
+            "sqlite" => args.sqlite_path = value.to_string(),
+            "no_sqlite" => args.no_sqlite = parse_bool(value)?,
+            "stats_interval_ms" => args.stats_interval_ms = parse_u64(value, "stats_interval_ms")?,
+            "stats_width" => args.stats_width = parse_usize(value, "stats_width")?,
+            "stats_top" => args.stats_top = parse_usize(value, "stats_top")?,
+            "no_banner" => args.no_banner = parse_bool(value)?,
+            "theme" => args.theme = parse_theme(value)?,
+            _ => {
+                eprintln!(
+                    "warning: unknown config key '{}' in {}", key, path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_list_value(target: &mut Vec<String>, value: &str) {
+    for part in value.split(',') {
+        let trimmed = part.trim();
+        if !trimmed.is_empty() {
+            target.push(trimmed.to_string());
+        }
+    }
+}
+
+fn parse_bool(value: &str) -> Result<bool, String> {
+    match value.to_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!("Invalid boolean value '{}'.", value)),
+    }
+}
+
+fn print_help() {
+    println!(
+        "rano - AI CLI network observer\n\nUSAGE:\n  rano [options]\n  rano update [options]\n\nOPTIONS:\n  --pattern <str>           Process name or cmdline substring to match (repeatable)\n  --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n  --pid <pid>               Monitor a specific PID (repeatable)\n  --no-descendants          Do not include descendant processes\n  --interval-ms <ms>        Poll interval (default: 1000)\n  --json                    Emit JSON lines to stdout\n  --summary-only            Suppress live events, show summary only\n  --domain-mode <mode>      auto|ptr|pcap (default: auto)\n  --pcap                    Force pcap mode (falls back with warning)\n  --no-dns                  Disable PTR lookups\n  --include-udp             Include UDP sockets (default: true)\n  --no-udp                  Disable UDP sockets\n  --include-listening       Include listening TCP sockets\n  --log-file <path>         Append output to log file\n  --log-dir <path>          Write per-run log files into directory\n  --log-format <fmt>        auto|pretty|json for log files (default: auto)\n  --once                    Emit a single poll and exit\n  --color <mode>            auto|always|never (default: auto)\n  --no-color                Disable ANSI color\n  --theme <name>            vivid|mono (default: vivid)\n  --sqlite <path>           SQLite file for persistent logging\n  --no-sqlite               Disable SQLite logging\n  --stats-interval-ms <ms>  Live stats interval (0 disables)\n  --stats-width <n>         ASCII bar width\n  --stats-top <n>           Top-N domains/IPs in stats/summary\n  --no-banner               Suppress startup banner\n  --config <path>           Load config file (key=value format)\n  --no-config               Ignore config file\n  -h, --help                Show this help\n  -V, --version             Show version\n"
+    );
+}
+
+fn print_update_help() {
+    println!(
+        "rano update - update the binary\n\nUSAGE:\n  rano update [options]\n\nOPTIONS:\n  --version <v>     Install a specific version (e.g., v0.2.0)\n  --system          Install system-wide (/usr/local/bin)\n  --easy-mode       Auto-update PATH in shell rc files\n  --dest <path>     Install destination directory\n  --from-source     Build from source instead of downloading binaries\n  --verify          Verify installation after update\n  --quiet           Suppress non-error output\n  --no-gum          Disable gum formatting in installer\n  --owner <owner>   GitHub owner/org override\n  --repo <repo>     GitHub repo override\n  --branch <name>   GitHub branch (default: main)\n  -h, --help        Show this help\n  -V, --version     Show version\n"
+    );
+}
+
+fn print_version() {
+    println!("rano {}", env!("CARGO_PKG_VERSION"));
+}
+
+fn resolve_color_mode(mode: ColorMode) -> bool {
+    match mode {
+        ColorMode::Auto => stdout_is_tty(),
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+    }
+}
+
+fn stdout_is_tty() -> bool {
+    #[cfg(unix)]
+    unsafe {
+        libc::isatty(libc::STDOUT_FILENO) == 1
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn paint(text: &str, color: Option<AnsiColor>, bold: bool, dim: bool, enabled: bool) -> String {
+    if !enabled {
+        return text.to_string();
+    }
+    let mut codes: Vec<&str> = Vec::new();
+    if let Some(c) = color {
+        codes.push(c.code());
+    }
+    if bold {
+        codes.push("1");
+    }
+    if dim {
+        codes.push("2");
+    }
+    if codes.is_empty() {
+        return text.to_string();
+    }
+    format!("\x1b[{}m{}\x1b[0m", codes.join(";"), text)
+}
+
+fn default_patterns() -> Vec<String> {
+    vec!["claude".to_string(), "codex".to_string(), "gemini".to_string()]
+}
+
+fn resolve_domain_mode(args: &MonitorArgs) -> (DomainMode, Option<String>) {
+    let wants_pcap = args.pcap || matches!(args.domain_mode, DomainMode::Pcap);
+    if wants_pcap {
+        let reason = if is_root() {
+            "pcap capture not available in this build; falling back to PTR.".to_string()
+        } else {
+            "pcap capture requires elevated privileges and libpcap; falling back to PTR.".to_string()
+        };
+        return (DomainMode::Ptr, Some(reason));
+    }
+
+    match args.domain_mode {
+        DomainMode::Auto => (DomainMode::Ptr, None),
+        DomainMode::Ptr => (DomainMode::Ptr, None),
+        DomainMode::Pcap => (
+            DomainMode::Ptr,
+            Some("pcap capture not available; falling back to PTR.".to_string()),
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn is_root() -> bool {
+    false
+}
+
+fn setup_signal_handler() {
+    #[cfg(unix)]
+    unsafe {
+        extern "C" fn handle(_sig: i32) {
+            RUNNING.store(false, Ordering::SeqCst);
+        }
+        libc::signal(libc::SIGINT, handle as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, handle as libc::sighandler_t);
+    }
+}
+
+fn hostname() -> String {
+    if let Ok(name) = env::var("HOSTNAME") {
+        if !name.trim().is_empty() {
+            return name;
+        }
+    }
+    if let Ok(contents) = fs::read_to_string("/etc/hostname") {
+        let trimmed = contents.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+fn now_rfc3339() -> String {
+    system_time_to_rfc3339(SystemTime::now())
+}
+
+fn system_time_to_rfc3339(t: SystemTime) -> String {
+    let dur = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let raw: libc::time_t = dur.as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
+    unsafe {
+        libc::gmtime_r(&raw, &mut tm);
+    }
+    #[cfg(not(unix))]
+    unsafe {
+        libc::gmtime_s(&mut tm, &raw);
+    }
+    let year = tm.tm_year + 1900;
+    let mon = tm.tm_mon + 1;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, mon, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec
+    )
+}
+
+fn banner(
+    args: &MonitorArgs,
+    domain_label: &str,
+    domain_note: Option<&str>,
+    style: OutputStyle,
+    log_writer: &Option<Arc<LogWriter>>,
+) {
+    let patterns = if args.patterns.is_empty() {
+        "claude, codex, gemini".to_string()
+    } else {
+        args.patterns.join(", ")
+    };
+    let headline = paint("rano", style.accent(), true, false, style.color);
+    let line = format!(
+        "{} patterns=[{}] interval={}ms json={} domain={} udp={} listening={} once={} sqlite={} stats={}ms log_file={} log_dir={}",
+        headline,
+        patterns,
+        args.interval_ms,
+        args.json,
+        domain_label,
+        args.include_udp,
+        args.include_listening,
+        args.once,
+        if args.no_sqlite { "disabled" } else { &args.sqlite_path },
+        args.stats_interval_ms,
+        args.log_file.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".to_string()),
+        args.log_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".to_string()),
+    );
+
+    if args.json {
+        eprintln!("{}", strip_ansi(&line));
+    } else {
+        println!("{}", line);
+    }
+
+    if let Some(note) = domain_note {
+        let warning = format!("warning: {}", note);
+        if args.json {
+            eprintln!("{}", warning);
+        } else {
+            println!("{}", paint(&warning, Some(AnsiColor::BrightYellow), true, false, style.color));
+        }
+        if let Some(writer) = log_writer.as_ref() {
+            writer.write_line(&strip_ansi(&warning));
+        }
+    }
+}
+
+fn log_format_for_output(json_mode: bool, log_format: LogFormat) -> LogFormat {
+    match log_format {
+        LogFormat::Auto => {
+            if json_mode {
+                LogFormat::Json
+            } else {
+                LogFormat::Pretty
+            }
+        }
+        other => other,
+    }
+}
+
+fn emit_event(
+    event: &str,
+    run_id: &str,
+    key: &ConnKey,
+    pid: u32,
+    comm: &str,
+    cmdline: &str,
+    provider: Provider,
+    domain: Option<&str>,
+    duration_ms: Option<u64>,
+    json_mode: bool,
+    style: OutputStyle,
+    log_format: LogFormat,
+    log_writer: Option<&Arc<LogWriter>>,
+    sqlite: Option<&Arc<Mutex<Connection>>>,
+) {
+    let ts = now_rfc3339();
+    let proto = match key.proto {
+        Proto::Tcp => "tcp",
+        Proto::Udp => "udp",
+    };
+    let local = format!("{}:{}", key.local_ip, key.local_port);
+    let remote = format!("{}:{}", key.remote_ip, key.remote_port);
+    let dom = domain.unwrap_or("unknown");
+
+    if let Some(conn) = sqlite {
+        if let Ok(mut c) = conn.lock() {
+            let _ = log_sqlite(
+                &mut c, event, run_id, key, pid, comm, cmdline, provider, domain, duration_ms,
+            );
+        }
+    }
+
+    if json_mode {
+        let line = format_json_event(
+            &ts,
+            run_id,
+            event,
+            pid,
+            comm,
+            cmdline,
+            provider.label(),
+            proto,
+            &local,
+            &remote,
+            dom,
+            duration_ms,
+        );
+        println!("{}", line);
+        if let Some(writer) = log_writer {
+            writer.write_line(&line);
+        }
+        return;
+    }
+
+    let line_plain = format_pretty_event(
+        &ts,
+        event,
+        pid,
+        comm,
+        proto,
+        &local,
+        &remote,
+        dom,
+        provider,
+        duration_ms,
+        None,
+    );
+
+    let line_colored = format_pretty_event(
+        &ts,
+        event,
+        pid,
+        comm,
+        proto,
+        &local,
+        &remote,
+        dom,
+        provider,
+        duration_ms,
+        Some(style),
+    );
+
+    println!("{}", line_colored);
+
+    if let Some(writer) = log_writer {
+        let output = match log_format {
+            LogFormat::Json => format_json_event(
+                &ts,
+                run_id,
+                event,
+                pid,
+                comm,
+                cmdline,
+                provider.label(),
+                proto,
+                &local,
+                &remote,
+                dom,
+                duration_ms,
+            ),
+            _ => strip_ansi(&line_plain),
+        };
+        writer.write_line(&output);
+    }
+}
+
+fn format_pretty_event(
+    ts: &str,
+    event: &str,
+    pid: u32,
+    comm: &str,
+    proto: &str,
+    local: &str,
+    remote: &str,
+    domain: &str,
+    provider: Provider,
+    duration_ms: Option<u64>,
+    style: Option<OutputStyle>,
+) -> String {
+    let style = style.unwrap_or(OutputStyle {
+        color: false,
+        theme: Theme::Mono,
+    });
+
+    let event_label = match event {
+        "connect" => "+ connect",
+        "close" => "- close",
+        _ => event,
+    };
+
+    let event_text = paint(event_label, style.event_color(event), true, false, style.color);
+    let provider_text = paint(
+        provider.label(),
+        style.provider_color(provider),
+        true,
+        false,
+        style.color,
+    );
+    let pid_text = paint(&format!("pid={}", pid), Some(AnsiColor::BrightCyan), true, false, style.color);
+    let comm_text = paint(comm, Some(AnsiColor::BrightWhite), true, false, style.color);
+    let proto_text = paint(proto, Some(AnsiColor::BrightMagenta), true, false, style.color);
+    let domain_text = if domain == "unknown" {
+        paint(domain, Some(AnsiColor::BrightBlack), false, true, style.color)
+    } else {
+        paint(domain, Some(AnsiColor::BrightWhite), false, false, style.color)
+    };
+    let ts_text = if style.color {
+        paint(ts, Some(AnsiColor::BrightBlack), false, true, style.color)
+    } else {
+        ts.to_string()
+    };
+
+    let duration_text = duration_ms.map(|ms| format!(" dur={}ms", ms)).unwrap_or_default();
+
+    format!(
+        "{} | {} | {} | {} | {} | {} | {} -> {} | domain={}{}",
+        ts_text, event_text, provider_text, pid_text, comm_text, proto_text, local, remote, domain_text, duration_text
+    )
+}
+
+fn format_json_event(
+    ts: &str,
+    run_id: &str,
+    event: &str,
+    pid: u32,
+    comm: &str,
+    cmdline: &str,
+    provider: &str,
+    proto: &str,
+    local: &str,
+    remote: &str,
+    domain: &str,
+    duration_ms: Option<u64>,
+) -> String {
+    let mut out = String::new();
+    out.push('{');
+    push_json_str(&mut out, "ts", ts, true);
+    push_json_str(&mut out, "run_id", run_id, false);
+    push_json_str(&mut out, "event", event, false);
+    push_json_num(&mut out, "pid", pid as i64, false);
+    push_json_str(&mut out, "comm", comm, false);
+    push_json_str(&mut out, "cmdline", cmdline, false);
+    push_json_str(&mut out, "provider", provider, false);
+    push_json_str(&mut out, "proto", proto, false);
+    push_json_str(&mut out, "local", local, false);
+    push_json_str(&mut out, "remote", remote, false);
+    push_json_str(&mut out, "domain", domain, false);
+    if let Some(ms) = duration_ms {
+        push_json_num(&mut out, "duration_ms", ms as i64, false);
+    }
+    out.push('}');
+    out
+}
+
+fn summary(
+    stats: &Stats,
+    json_mode: bool,
+    stats_top: usize,
+    style: OutputStyle,
+    log_writer: Option<&Arc<LogWriter>>,
+) {
+    if json_mode {
+        let line = format_json_summary(stats);
+        println!("{}", line);
+        if let Some(writer) = log_writer {
+            writer.write_line(&line);
+        }
+        return;
+    }
+
+    println!("{}", paint("Summary", style.accent(), true, false, style.color));
+    println!(
+        "  {} {}",
+        paint("connects", Some(AnsiColor::BrightWhite), true, false, style.color),
+        paint(&stats.connects.to_string(), Some(AnsiColor::BrightGreen), true, false, style.color)
+    );
+    println!(
+        "  {} {}",
+        paint("closes", Some(AnsiColor::BrightWhite), true, false, style.color),
+        paint(&stats.closes.to_string(), Some(AnsiColor::BrightYellow), true, false, style.color)
+    );
+    println!(
+        "  {} {} (peak={})",
+        paint("active", Some(AnsiColor::BrightWhite), true, false, style.color),
+        paint(&stats.active.to_string(), Some(AnsiColor::BrightCyan), true, false, style.color),
+        stats.peak_active
+    );
+
+    if stats.duration_ms_samples > 0 {
+        let avg = stats.duration_ms_total / stats.duration_ms_samples;
+        println!(
+            "  {} {}ms (max={}ms)",
+            paint("avg_duration", Some(AnsiColor::BrightWhite), true, false, style.color),
+            paint(&avg.to_string(), Some(AnsiColor::BrightCyan), true, false, style.color),
+            stats.duration_ms_max
+        );
+    }
+
+    if !stats.per_provider.is_empty() {
+        println!("{}", paint("  Providers", style.accent(), true, false, style.color));
+        for (provider, count) in stats.per_provider.iter() {
+            let name = paint(
+                provider.label(),
+                style.provider_color(*provider),
+                true,
+                false,
+                style.color,
+            );
+            println!("    {} {}", count, name);
+        }
+    }
+
+    if !stats.per_domain.is_empty() {
+        println!("{}", paint("  Top Domains", style.accent(), true, false, style.color));
+        for (name, count) in top_n_string(&stats.per_domain, stats_top) {
+            println!("    {} {}", count, name);
+        }
+    }
+
+    if !stats.per_ip.is_empty() {
+        println!("{}", paint("  Top IPs", style.accent(), true, false, style.color));
+        for (ip, count) in top_n_string(&stats.per_ip, stats_top) {
+            println!("    {} {}", count, ip);
+        }
+    }
+
+    if !stats.per_comm.is_empty() {
+        println!("{}", paint("  Top Processes", style.accent(), true, false, style.color));
+        for (comm, count) in top_n_string(&stats.per_comm, stats_top) {
+            println!("    {} {}", count, comm);
+        }
+    }
+
+    if let Some(writer) = log_writer {
+        let line = format!(
+            "summary connects={} closes={} active={} peak_active={}",
+            stats.connects, stats.closes, stats.active, stats.peak_active
+        );
+        writer.write_line(&line);
+    }
+}
+
+fn format_json_summary(stats: &Stats) -> String {
+    let mut out = String::new();
+    out.push('{');
+    out.push_str("\"summary\":{");
+    push_json_num(&mut out, "connects", stats.connects as i64, true);
+    push_json_num(&mut out, "closes", stats.closes as i64, false);
+    push_json_num(&mut out, "active", stats.active as i64, false);
+    push_json_num(&mut out, "peak_active", stats.peak_active as i64, false);
+    if stats.duration_ms_samples > 0 {
+        let avg = stats.duration_ms_total / stats.duration_ms_samples;
+        push_json_num(&mut out, "avg_duration_ms", avg as i64, false);
+        push_json_num(&mut out, "max_duration_ms", stats.duration_ms_max as i64, false);
+    }
+    push_json_map_ip(&mut out, "per_ip", &stats.per_ip, false);
+    push_json_map_str(&mut out, "per_domain", &stats.per_domain, false);
+    push_json_map_u32(&mut out, "per_pid", &stats.per_pid, false);
+    push_json_map_str(&mut out, "per_comm", &stats.per_comm, false);
+    push_json_map_provider(&mut out, "per_provider", &stats.per_provider, false);
+    out.push('}');
+    out.push('}');
+    out
+}
+
+fn top_n_string<K: ToString + Ord>(map: &BTreeMap<K, u64>, n: usize) -> Vec<(String, u64)> {
+    let mut items: Vec<(String, u64)> = map.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items.truncate(n);
+    items
+}
+
+fn print_stats(stats: &Stats, width: usize, top: usize, style: OutputStyle) {
+    let total = stats
+        .per_provider
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let providers = [
+        Provider::Anthropic,
+        Provider::OpenAI,
+        Provider::Google,
+        Provider::Unknown,
+    ];
+    println!("{}", paint("Live Provider Stats", style.accent(), true, false, style.color));
+    for provider in providers {
+        let count = *stats.per_provider.get(&provider).unwrap_or(&0);
+        let bar_len = ((count as f64 / total as f64) * width as f64).round() as usize;
+        let bar_plain = format!("{:width$}", "█".repeat(bar_len), width = width);
+        let bar = if style.color {
+            paint(&bar_plain, style.provider_color(provider), false, false, style.color)
+        } else {
+            bar_plain
+        };
+        let label = paint(
+            provider.label(),
+            style.provider_color(provider),
+            true,
+            false,
+            style.color,
+        );
+        let domains = stats
+            .per_provider_domains
+            .get(&provider)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let ips = stats
+            .per_provider_ips
+            .get(&provider)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        println!(
+            "  {:<10} | {} {} (domains={}, ips={})",
+            label, bar, count, domains, ips
+        );
+    }
+    println!(
+        "  active={} peak={} avg_dur={}ms",
+        stats.active,
+        stats.peak_active,
+        if stats.duration_ms_samples > 0 {
+            stats.duration_ms_total / stats.duration_ms_samples
+        } else {
+            0
+        }
+    );
+
+    let top_domains = top_n_string(&stats.per_domain, top);
+    if !top_domains.is_empty() {
+        let parts = top_domains
+            .iter()
+            .map(|(d, c)| format!("{}({})", d, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  top domains: {}", parts);
+    }
+
+    let top_ips = top_n_string(&stats.per_ip, top);
+    if !top_ips.is_empty() {
+        let parts = top_ips
+            .iter()
+            .map(|(d, c)| format!("{}({})", d, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  top ips: {}", parts);
+    }
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            while let Some(next) = chars.next() {
+                if next == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn open_log_writer(args: &MonitorArgs, domain_label: &str) -> Option<Arc<LogWriter>> {
+    let path = if let Some(file) = &args.log_file {
+        Some(file.clone())
+    } else if let Some(dir) = &args.log_dir {
+        let _ = fs::create_dir_all(dir);
+        let ts = now_rfc3339().replace(':', "");
+        let ext = match args.log_format {
+            LogFormat::Json => "jsonl",
+            _ => "log",
+        };
+        let filename = format!("rano-{}-{}.{}", ts, domain_label, ext);
+        Some(dir.join(filename))
+    } else {
+        None
+    };
+
+    let path = match path {
+        Some(p) => p,
+        None => return None,
+    };
+
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+
+    Some(Arc::new(LogWriter {
+        file: Mutex::new(file),
+        format: args.log_format,
+    }))
+}
+
+fn self_update(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let (owner, repo) = resolve_repo(&update)?;
+    let branch = update
+        .branch
+        .clone()
+        .or_else(|| env::var("RANO_BRANCH").ok())
+        .unwrap_or_else(|| "main".to_string());
+
+    if cfg!(windows) {
+        return self_update_windows(&update, &owner, &repo, &branch);
+    }
+
+    self_update_unix(&update, &owner, &repo, &branch)
+}
+
+fn resolve_repo(update: &UpdateCommand) -> Result<(String, String), Box<dyn std::error::Error>> {
+    const DEFAULT_OWNER: &str = "lumera-ai";
+    const DEFAULT_REPO: &str = "rano";
+
+    if update.owner.is_some() || update.repo.is_some() {
+        let owner = update
+            .owner
+            .clone()
+            .ok_or_else(|| "Missing --owner (both --owner and --repo are required when overriding).")?;
+        let repo = update
+            .repo
+            .clone()
+            .ok_or_else(|| "Missing --repo (both --owner and --repo are required when overriding).")?;
+        return Ok((owner, repo));
+    }
+    if let (Ok(owner), Ok(repo)) = (env::var("RANO_OWNER"), env::var("RANO_REPO")) {
+        return Ok((owner, repo));
+    }
+    if let Some((owner, repo)) = repo_from_git() {
+        return Ok((owner, repo));
+    }
+    eprintln!(
+        "Using default update repo {}/{} (set RANO_OWNER/RANO_REPO to override).",
+        DEFAULT_OWNER, DEFAULT_REPO
+    );
+    Ok((DEFAULT_OWNER.to_string(), DEFAULT_REPO.to_string()))
+}
+
+fn repo_from_git() -> Option<(String, String)> {
+    let output = ProcessCommand::new("git")
+        .arg("config")
+        .arg("--get")
+        .arg("remote.origin.url")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    parse_github_repo(&url)
+}
+
+fn parse_github_repo(url: &str) -> Option<(String, String)> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(stripped) = trimmed.strip_prefix("git@github.com:") {
+        return split_owner_repo(stripped);
+    }
+    if let Some(stripped) = trimmed.strip_prefix("https://github.com/") {
+        return split_owner_repo(stripped);
+    }
+    if let Some(stripped) = trimmed.strip_prefix("ssh://git@github.com/") {
+        return split_owner_repo(stripped);
+    }
+    None
+}
+
+fn split_owner_repo(input: &str) -> Option<(String, String)> {
+    let trimmed = input.trim_end_matches(".git").trim_matches('/');
+    let mut iter = trimmed.splitn(2, '/');
+    let owner = iter.next()?.to_string();
+    let repo = iter.next()?.to_string();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner, repo))
+}
+
+fn self_update_unix(
+    update: &UpdateCommand,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let script_url = format!(
+        "https://raw.githubusercontent.com/{}/{}/{}/install.sh",
+        owner, repo, branch
+    );
+    let mut args: Vec<String> = Vec::new();
+
+    if let Some(version) = &update.version {
+        args.push("--version".to_string());
+        args.push(version.clone());
+    }
+    if update.system {
+        args.push("--system".to_string());
+    }
+    if update.easy_mode {
+        args.push("--easy-mode".to_string());
+    }
+    if let Some(dest) = &update.dest {
+        args.push("--dest".to_string());
+        args.push(dest.to_string_lossy().into_owned());
+    }
+    if update.from_source {
+        args.push("--from-source".to_string());
+    }
+    if update.verify {
+        args.push("--verify".to_string());
+    }
+    if update.quiet {
+        args.push("--quiet".to_string());
+    }
+    if update.no_gum {
+        args.push("--no-gum".to_string());
+    }
+
+    let mut escaped_args = String::new();
+    for (idx, arg) in args.iter().enumerate() {
+        if idx > 0 {
+            escaped_args.push(' ');
+        }
+        escaped_args.push_str(&shell_escape_posix(arg));
+    }
+
+    let mut command = String::new();
+    command.push_str("OWNER=");
+    command.push_str(&shell_escape_posix(owner));
+    command.push(' ');
+    command.push_str("REPO=");
+    command.push_str(&shell_escape_posix(repo));
+    command.push(' ');
+    if escaped_args.is_empty() {
+        command.push_str(&format!(
+            "curl -fsSL {} | bash -s --",
+            shell_escape_posix(&script_url)
+        ));
+    } else {
+        command.push_str(&format!(
+            "curl -fsSL {} | bash -s -- {}",
+            shell_escape_posix(&script_url),
+            escaped_args
+        ));
+    }
+
+    let status = ProcessCommand::new("sh").arg("-c").arg(command).status()?;
+    if !status.success() {
+        return Err(format!("Installer failed with status {status}").into());
+    }
+    Ok(())
+}
+
+fn self_update_windows(
+    update: &UpdateCommand,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if update.system || update.from_source || update.quiet || update.no_gum {
+        return Err(
+            "Windows updater supports only --version, --dest, --easy-mode, and --verify.".into(),
+        );
+    }
+
+    let script_url = format!(
+        "https://raw.githubusercontent.com/{}/{}/{}/install.ps1",
+        owner, repo, branch
+    );
+    let mut args: Vec<String> = Vec::new();
+
+    args.push(format!("-Owner {}", shell_escape_powershell(owner)));
+    args.push(format!("-Repo {}", shell_escape_powershell(repo)));
+
+    if let Some(version) = &update.version {
+        args.push(format!("-Version {}", shell_escape_powershell(version)));
+    }
+    if let Some(dest) = &update.dest {
+        args.push(format!(
+            "-Dest {}",
+            shell_escape_powershell(&dest.to_string_lossy())
+        ));
+    }
+    if update.easy_mode {
+        args.push("-EasyMode".to_string());
+    }
+    if update.verify {
+        args.push("-Verify".to_string());
+    }
+
+    let args_str = args.join(" ");
+
+    let command = format!(
+        "$ErrorActionPreference='Stop'; \
+$url={url}; \
+$script=(Invoke-WebRequest -UseBasicParsing $url).Content; \
+$sb=[ScriptBlock]::Create($script); \
+& $sb {args}",
+        url = shell_escape_powershell(&script_url),
+        args = args_str,
+    );
+
+    let status = ProcessCommand::new("powershell")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(command)
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("Installer failed with status {status}").into());
+    }
+    Ok(())
+}
+
+fn shell_escape_posix(input: &str) -> String {
+    if input.is_empty() {
+        return "''".to_string();
+    }
+    if input
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+    {
+        return input.to_string();
+    }
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+fn shell_escape_powershell(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "''"))
+}
+
+fn resolve_domain(ip: IpAddr, cache: &mut HashMap<IpAddr, DnsCacheEntry>) -> Option<String> {
+    let now = SystemTime::now();
+    let ttl = Duration::from_secs(600);
+    if let Some(entry) = cache.get(&ip) {
+        if now.duration_since(entry.stored_at).unwrap_or_default() < ttl {
+            return entry.value.clone();
+        }
+    }
+
+    let result = reverse_dns(ip);
+    cache.insert(
+        ip,
+        DnsCacheEntry {
+            value: result.clone(),
+            stored_at: now,
+        },
+    );
+    result
+}
+
+fn reverse_dns(ip: IpAddr) -> Option<String> {
+    unsafe {
+        let mut host = [0i8; libc::NI_MAXHOST as usize];
+        let flags = libc::NI_NAMEREQD;
+        match ip {
+            IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                let addr = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as u16,
+                    sin_port: 0,
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_be_bytes(octets),
+                    },
+                    sin_zero: [0; 8],
+                };
+                let ret = libc::getnameinfo(
+                    &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as u32,
+                    host.as_mut_ptr(),
+                    host.len() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    flags,
+                );
+                if ret == 0 {
+                    return Some(CStr::from_ptr(host.as_ptr()).to_string_lossy().to_string());
+                }
+            }
+            IpAddr::V6(v6) => {
+                let addr = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as u16,
+                    sin6_port: 0,
+                    sin6_flowinfo: 0,
+                    sin6_addr: libc::in6_addr { s6_addr: v6.octets() },
+                    sin6_scope_id: 0,
+                };
+                let ret = libc::getnameinfo(
+                    &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as u32,
+                    host.as_mut_ptr(),
+                    host.len() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    flags,
+                );
+                if ret == 0 {
+                    return Some(CStr::from_ptr(host.as_ptr()).to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Clone, Debug)]
+struct PidMeta {
+    comm: String,
+    cmdline: String,
+    provider: Provider,
+}
+
+fn find_root_pids(patterns: &[String], exclude_patterns: &[String], explicit_pids: &[u32]) -> Vec<u32> {
+    let lowered: Vec<String> = patterns.iter().map(|p| p.to_lowercase()).collect();
+    let excluded: Vec<String> = exclude_patterns.iter().map(|p| p.to_lowercase()).collect();
+    let mut roots = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+
+    for pid in explicit_pids {
+        if seen.insert(*pid) {
+            roots.push(*pid);
+        }
+    }
+
+    if lowered.is_empty() {
+        return roots;
+    }
+
+    for pid in list_pids() {
+        let comm = read_comm(pid).unwrap_or_default();
+        let cmd = read_cmdline(pid).unwrap_or_default();
+        let comm_l = comm.to_lowercase();
+        let cmd_l = cmd.to_lowercase();
+        if !excluded.is_empty() && excluded.iter().any(|p| comm_l.contains(p) || cmd_l.contains(p)) {
+            continue;
+        }
+        if lowered.iter().any(|p| comm_l.contains(p) || cmd_l.contains(p)) {
+            if seen.insert(pid) {
+                roots.push(pid);
+            }
+        }
+    }
+    roots
+}
+
+fn collect_descendants(roots: &[u32]) -> HashSet<u32> {
+    let mut parent_map: HashMap<u32, Vec<u32>> = HashMap::new();
+    for pid in list_pids() {
+        if let Some(ppid) = read_ppid(pid) {
+            parent_map.entry(ppid).or_default().push(pid);
+        }
+    }
+
+    let mut set: HashSet<u32> = HashSet::new();
+    let mut stack: Vec<u32> = roots.to_vec();
+    while let Some(pid) = stack.pop() {
+        if !set.insert(pid) {
+            continue;
+        }
+        if let Some(children) = parent_map.get(&pid) {
+            for child in children {
+                stack.push(*child);
+            }
+        }
+    }
+    set
+}
+
+fn map_inodes(targets: &HashSet<u32>) -> HashMap<u64, u32> {
+    let mut map = HashMap::new();
+    for pid in targets {
+        let fd_dir = format!("/proc/{}/fd", pid);
+        if let Ok(entries) = fs::read_dir(fd_dir) {
+            for entry in entries.flatten() {
+                if let Ok(link) = fs::read_link(entry.path()) {
+                    let link_str = link.to_string_lossy();
+                    if let Some(inode) = parse_socket_inode(&link_str) {
+                        map.insert(inode, *pid);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+fn build_pid_meta_map(targets: &HashSet<u32>) -> HashMap<u32, PidMeta> {
+    let mut map = HashMap::new();
+    for pid in targets {
+        let comm = read_comm(*pid).unwrap_or_else(|| "unknown".to_string());
+        let cmdline = read_cmdline(*pid).unwrap_or_default();
+        let provider = provider_from_text(&comm, &cmdline);
+        map.insert(
+            *pid,
+            PidMeta {
+                comm,
+                cmdline,
+                provider,
+            },
+        );
+    }
+    map
+}
+
+fn provider_from_text(comm: &str, cmdline: &str) -> Provider {
+    let text = format!("{} {}", comm.to_lowercase(), cmdline.to_lowercase());
+    if text.contains("claude") {
+        Provider::Anthropic
+    } else if text.contains("codex") || text.contains("openai") {
+        Provider::OpenAI
+    } else if text.contains("gemini") {
+        Provider::Google
+    } else {
+        Provider::Unknown
+    }
+}
+
+fn parse_socket_inode(link: &str) -> Option<u64> {
+    if let Some(start) = link.find("socket:[") {
+        let rest = &link[start + 8..];
+        if let Some(end) = rest.find(']') {
+            let inode_str = &rest[..end];
+            return inode_str.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+fn list_pids() -> Vec<u32> {
+    let mut pids = Vec::new();
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if let Ok(pid) = name.parse::<u32>() {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    pids
+}
+
+fn read_comm(pid: u32) -> Option<String> {
+    let path = format!("/proc/{}/comm", pid);
+    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+fn read_cmdline(pid: u32) -> Option<String> {
+    let path = format!("/proc/{}/cmdline", pid);
+    let mut data = Vec::new();
+    if let Ok(mut file) = fs::File::open(path) {
+        if file.read_to_end(&mut data).is_ok() {
+            let cmd = data
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Some(cmd);
+        }
+    }
+    None
+}
+
+fn read_ppid(pid: u32) -> Option<u32> {
+    let path = format!("/proc/{}/stat", pid);
+    let content = fs::read_to_string(path).ok()?;
+    let parts: Vec<&str> = content.split_whitespace().collect();
+    if parts.len() > 3 {
+        parts[3].parse::<u32>().ok()
+    } else {
+        None
+    }
+}
+
+fn gather_net_entries(include_udp: bool) -> Vec<(Proto, NetEntry)> {
+    let mut entries = Vec::new();
+    entries.extend(read_net_file("/proc/net/tcp", Proto::Tcp, false));
+    entries.extend(read_net_file("/proc/net/tcp6", Proto::Tcp, true));
+    if include_udp {
+        entries.extend(read_net_file("/proc/net/udp", Proto::Udp, false));
+        entries.extend(read_net_file("/proc/net/udp6", Proto::Udp, true));
+    }
+    entries
+}
+
+fn read_net_file(path: &str, proto: Proto, ipv6: bool) -> Vec<(Proto, NetEntry)> {
+    let mut result = Vec::new();
+    if !Path::new(path).exists() {
+        return result;
+    }
+    let content = fs::read_to_string(path).unwrap_or_default();
+    for (idx, line) in content.lines().enumerate() {
+        if idx == 0 {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 10 {
+            continue;
+        }
+        let local = parts[1];
+        let remote = parts[2];
+        let state = parts[3].to_string();
+        let inode = parts[9].parse::<u64>().unwrap_or(0);
+
+        let (local_ip, local_port) = match parse_addr_port(local, ipv6) {
+            Some(v) => v,
+            None => continue,
+        };
+        let (remote_ip, remote_port) = match parse_addr_port(remote, ipv6) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        result.push((
+            proto,
+            NetEntry {
+                local_ip,
+                local_port,
+                remote_ip,
+                remote_port,
+                inode,
+                state,
+            },
+        ));
+    }
+    result
+}
+
+fn parse_addr_port(s: &str, ipv6: bool) -> Option<(IpAddr, u16)> {
+    let mut iter = s.split(':');
+    let addr_hex = iter.next()?;
+    let port_hex = iter.next()?;
+    let port = u16::from_str_radix(port_hex, 16).ok()?;
+    let ip = if ipv6 {
+        IpAddr::V6(parse_ipv6(addr_hex)?)
+    } else {
+        IpAddr::V4(parse_ipv4(addr_hex)?)
+    };
+    Some((ip, port))
+}
+
+fn parse_ipv4(hex: &str) -> Option<Ipv4Addr> {
+    if hex.len() != 8 {
+        return None;
+    }
+    let raw = u32::from_str_radix(hex, 16).ok()?;
+    let bytes = raw.to_le_bytes();
+    Some(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
+}
+
+fn parse_ipv6(hex: &str) -> Option<Ipv6Addr> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for i in 0..4 {
+        let part = &hex[i * 8..(i + 1) * 8];
+        let raw = u32::from_str_radix(part, 16).ok()?;
+        let chunk = raw.to_le_bytes();
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&chunk);
+    }
+    Some(Ipv6Addr::from(bytes))
+}
+
+fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            run_id TEXT,
+            event TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            pid INTEGER,
+            comm TEXT,
+            cmdline TEXT,
+            proto TEXT,
+            local_ip TEXT,
+            local_port INTEGER,
+            remote_ip TEXT,
+            remote_port INTEGER,
+            domain TEXT,
+            remote_is_private INTEGER,
+            ip_version INTEGER,
+            duration_ms INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            run_id TEXT PRIMARY KEY,
+            start_ts TEXT NOT NULL,
+            end_ts TEXT,
+            host TEXT,
+            user TEXT,
+            patterns TEXT,
+            domain_mode TEXT,
+            args TEXT,
+            interval_ms INTEGER,
+            stats_interval_ms INTEGER,
+            connects INTEGER,
+            closes INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+        CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);
+        CREATE INDEX IF NOT EXISTS idx_events_provider ON events(provider);
+        CREATE INDEX IF NOT EXISTS idx_events_remote_ip ON events(remote_ip);
+        CREATE INDEX IF NOT EXISTS idx_events_domain ON events(domain);
+        CREATE VIEW IF NOT EXISTS provider_counts AS
+            SELECT provider,
+                   COUNT(*) AS events,
+                   SUM(CASE WHEN event='connect' THEN 1 ELSE 0 END) AS connects,
+                   SUM(CASE WHEN event='close' THEN 1 ELSE 0 END) AS closes
+            FROM events GROUP BY provider;
+        CREATE VIEW IF NOT EXISTS provider_domains AS
+            SELECT provider, domain, COUNT(*) AS events
+            FROM events WHERE domain IS NOT NULL AND domain != 'unknown'
+            GROUP BY provider, domain;
+        CREATE VIEW IF NOT EXISTS provider_ips AS
+            SELECT provider, remote_ip, COUNT(*) AS events
+            FROM events GROUP BY provider, remote_ip;
+        CREATE VIEW IF NOT EXISTS provider_ports AS
+            SELECT provider, remote_port, COUNT(*) AS events
+            FROM events GROUP BY provider, remote_port;
+        CREATE VIEW IF NOT EXISTS provider_processes AS
+            SELECT provider, comm, COUNT(*) AS events
+            FROM events GROUP BY provider, comm;
+        CREATE VIEW IF NOT EXISTS provider_last_hour AS
+            SELECT provider, COUNT(*) AS events
+            FROM events
+            WHERE ts >= datetime('now','-1 hour')
+            GROUP BY provider;
+        CREATE VIEW IF NOT EXISTS provider_hourly AS
+            SELECT provider,
+                   strftime('%Y-%m-%dT%H:00:00Z', ts) AS hour,
+                   COUNT(*) AS events
+            FROM events
+            GROUP BY provider, hour;
+        CREATE VIEW IF NOT EXISTS session_summary AS
+            SELECT s.run_id,
+                   s.start_ts,
+                   s.end_ts,
+                   s.patterns,
+                   s.domain_mode,
+                   COUNT(e.id) AS events,
+                   SUM(CASE WHEN e.event='connect' THEN 1 ELSE 0 END) AS connects,
+                   SUM(CASE WHEN e.event='close' THEN 1 ELSE 0 END) AS closes
+            FROM sessions s LEFT JOIN events e ON e.run_id = s.run_id
+            GROUP BY s.run_id;
+        ",
+    )?;
+    ensure_column(conn, "events", "run_id", "TEXT")?;
+    ensure_column(conn, "events", "duration_ms", "INTEGER")?;
+    Ok(())
+}
+
+fn insert_session(conn: &mut Connection, ctx: &RunContext) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO sessions (run_id, start_ts, host, user, patterns, domain_mode, args, interval_ms, stats_interval_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            &ctx.run_id,
+            &ctx.start_ts,
+            &ctx.host,
+            &ctx.user,
+            &ctx.patterns,
+            &ctx.domain_label,
+            &ctx.args_snapshot,
+            ctx.interval_ms as i64,
+            ctx.stats_interval_ms as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+fn finalize_session(conn: &mut Connection, ctx: &RunContext, stats: &Stats) -> rusqlite::Result<()> {
+    let end_ts = now_rfc3339();
+    conn.execute(
+        "UPDATE sessions SET end_ts = ?1, connects = ?2, closes = ?3 WHERE run_id = ?4",
+        params![end_ts, stats.connects as i64, stats.closes as i64, &ctx.run_id],
+    )?;
+    Ok(())
+}
+
+fn ensure_column(
+    conn: &mut Connection,
+    table: &str,
+    column: &str,
+    col_type: &str,
+) -> rusqlite::Result<()> {
+    let pragma = format!("PRAGMA table_info({})", table);
+    let mut stmt = conn.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(());
+        }
+    }
+    let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type);
+    conn.execute(&sql, [])?;
+    Ok(())
+}
+
+fn log_sqlite(
+    conn: &mut Connection,
+    event: &str,
+    run_id: &str,
+    key: &ConnKey,
+    pid: u32,
+    comm: &str,
+    cmdline: &str,
+    provider: Provider,
+    domain: Option<&str>,
+    duration_ms: Option<u64>,
+) -> rusqlite::Result<()> {
+    let ts = now_rfc3339();
+    let proto = match key.proto {
+        Proto::Tcp => "tcp",
+        Proto::Udp => "udp",
+    };
+    let (is_private, ip_version) = ip_flags(key.remote_ip);
+    conn.execute(
+        "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, remote_is_private, ip_version, duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            ts,
+            run_id,
+            event,
+            provider.label(),
+            pid,
+            comm,
+            cmdline,
+            proto,
+            key.local_ip.to_string(),
+            key.local_port as i64,
+            key.remote_ip.to_string(),
+            key.remote_port as i64,
+            domain.unwrap_or("unknown"),
+            if is_private { 1 } else { 0 },
+            ip_version,
+            duration_ms.map(|v| v as i64),
+        ],
+    )?;
+    Ok(())
+}
+
+fn ip_flags(ip: IpAddr) -> (bool, i64) {
+    match ip {
+        IpAddr::V4(v4) => (v4.is_private(), 4),
+        IpAddr::V6(v6) => (v6.is_unique_local(), 6),
+    }
+}
+
+fn push_json_str(out: &mut String, key: &str, value: &str, first: bool) {
+    if !first {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":\"");
+    out.push_str(&escape_json(value));
+    out.push('"');
+}
+
+fn push_json_num(out: &mut String, key: &str, value: i64, first: bool) {
+    if !first {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":");
+    out.push_str(&value.to_string());
+}
+
+fn push_json_map_str(out: &mut String, key: &str, map: &BTreeMap<String, u64>, first: bool) {
+    if !first {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":{");
+    let mut first_entry = true;
+    for (k, v) in map.iter() {
+        if !first_entry {
+            out.push(',');
+        }
+        first_entry = false;
+        out.push('"');
+        out.push_str(&escape_json(k));
+        out.push_str("\":");
+        out.push_str(&v.to_string());
+    }
+    out.push('}');
+}
+
+fn push_json_map_ip(out: &mut String, key: &str, map: &BTreeMap<IpAddr, u64>, first: bool) {
+    if !first {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":{");
+    let mut first_entry = true;
+    for (k, v) in map.iter() {
+        if !first_entry {
+            out.push(',');
+        }
+        first_entry = false;
+        out.push('"');
+        out.push_str(&escape_json(&k.to_string()));
+        out.push_str("\":");
+        out.push_str(&v.to_string());
+    }
+    out.push('}');
+}
+
+fn push_json_map_u32(out: &mut String, key: &str, map: &BTreeMap<u32, u64>, first: bool) {
+    if !first {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":{");
+    let mut first_entry = true;
+    for (k, v) in map.iter() {
+        if !first_entry {
+            out.push(',');
+        }
+        first_entry = false;
+        out.push('"');
+        out.push_str(&k.to_string());
+        out.push_str("\":");
+        out.push_str(&v.to_string());
+    }
+    out.push('}');
+}
+
+fn push_json_map_provider(out: &mut String, key: &str, map: &BTreeMap<Provider, u64>, first: bool) {
+    if !first {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":{");
+    let mut first_entry = true;
+    for (k, v) in map.iter() {
+        if !first_entry {
+            out.push(',');
+        }
+        first_entry = false;
+        out.push('"');
+        out.push_str(k.label());
+        out.push_str("\":");
+        out.push_str(&v.to_string());
+    }
+    out.push('}');
+}
+
+fn escape_json(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 2);
+    for ch in input.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
