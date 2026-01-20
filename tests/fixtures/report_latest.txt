@@ -1,0 +1,35 @@
+
+rano report
+============================================================
+
+Session
+  Run ID:   run-2
+  Started:  2026-01-18T11:00:00Z
+  Ended:    2026-01-18T11:10:00Z
+  Duration: 10m
+  Host:     test-host
+  User:     tester
+  Patterns: codex, claude
+
+Summary
+  Events:  5 total (3 connects, 2 closes)
+  Active:  1 connections
+
+Providers
+  Provider   Events  Connects  Closes
+  ---------  ------  --------  ------
+  openai          3         2       1
+  anthropic       2         1       1
+
+Top Domains
+   #  Domain                                            Events  Provider 
+  --  ------------------------------------------------  ------  ---------
+   1  api.openai.com                                         3  openai   
+   2  api.anthropic.com                                      2  anthropic
+
+Top IPs
+   #  IP                                       Events  Domain                          
+  --  ---------------------------------------  ------  --------------------------------
+   1  1.1.1.1                                       3  api.openai.com                  
+   2  2.2.2.2                                       2  api.anthropic.com               
+

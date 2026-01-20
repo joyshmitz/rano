@@ -1,0 +1,61 @@
+{
+  "meta": {
+    "generated_at": "PLACEHOLDER",
+    "run_id": "run-2",
+    "version": "1.0"
+  },
+  "providers": [
+    {
+      "closes": 1,
+      "connects": 2,
+      "events": 3,
+      "provider": "openai"
+    },
+    {
+      "closes": 1,
+      "connects": 1,
+      "events": 2,
+      "provider": "anthropic"
+    }
+  ],
+  "session": {
+    "closes": 2,
+    "connects": 3,
+    "end_ts": "2026-01-18T11:10:00Z",
+    "host": "test-host",
+    "patterns": "codex, claude",
+    "run_id": "run-2",
+    "start_ts": "2026-01-18T11:00:00Z",
+    "user": "tester"
+  },
+  "summary": {
+    "active": 1,
+    "closes": 2,
+    "connects": 3,
+    "total_events": 5
+  },
+  "top_domains": [
+    {
+      "domain": "api.openai.com",
+      "events": 3,
+      "provider": "openai"
+    },
+    {
+      "domain": "api.anthropic.com",
+      "events": 2,
+      "provider": "anthropic"
+    }
+  ],
+  "top_ips": [
+    {
+      "domain": "api.openai.com",
+      "events": 3,
+      "ip": "1.1.1.1"
+    },
+    {
+      "domain": "api.anthropic.com",
+      "events": 2,
+      "ip": "2.2.2.2"
+    }
+  ]
+}

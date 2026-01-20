@@ -4322,7 +4322,165 @@ mod tests {
 
     #[test]
     fn parse_time_filter_rejects_invalid() {
-        let invalid = Some("not-a-time".to_string());
+        let invalid = Some("oops".to_string());
         assert!(parse_time_filter(&invalid).is_err());
+    }
+
+    // Batching unit tests
+
+    fn create_test_event(ts: &str, event: &str, provider: Provider) -> SqliteEvent {
+        SqliteEvent {
+            ts: ts.to_string(),
+            run_id: "test-run".to_string(),
+            event: event.to_string(),
+            key: ConnKey {
+                proto: Proto::Tcp,
+                local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                local_port: 12345,
+                remote_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+                remote_port: 443,
+            },
+            pid: 1234,
+            comm: "testproc".to_string(),
+            cmdline: "/usr/bin/testproc".to_string(),
+            provider,
+            domain: Some("test.example.com".to_string()),
+            duration_ms: if event == "close" { Some(1000) } else { None },
+        }
+    }
+
+    fn setup_test_db() -> Connection {
+        let mut conn = Connection::open_in_memory().expect("failed to open in-memory db");
+        init_sqlite(&mut conn).expect("failed to init schema");
+        conn
+    }
+
+    #[test]
+    fn write_sqlite_batch_handles_empty() {
+        let mut conn = setup_test_db();
+        let batch: Vec<SqliteEvent> = vec![];
+        let result = write_sqlite_batch(&mut conn, &batch);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn write_sqlite_batch_writes_single_event() {
+        let mut conn = setup_test_db();
+        let event = create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Anthropic);
+        let batch = vec![event];
+
+        let result = write_sqlite_batch(&mut conn, &batch);
+        assert!(result.is_ok());
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .expect("count query failed");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn write_sqlite_batch_writes_multiple_events() {
+        let mut conn = setup_test_db();
+        let batch = vec![
+            create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Anthropic),
+            create_test_event("2026-01-20T12:00:01Z", "connect", Provider::OpenAI),
+            create_test_event("2026-01-20T12:00:02Z", "connect", Provider::Google),
+            create_test_event("2026-01-20T12:00:03Z", "close", Provider::Anthropic),
+        ];
+
+        let result = write_sqlite_batch(&mut conn, &batch);
+        assert!(result.is_ok());
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .expect("count query failed");
+        assert_eq!(count, 4);
+
+        // Verify providers
+        let providers: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT DISTINCT provider FROM events ORDER BY provider").unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(providers, vec!["anthropic", "google", "openai"]);
+    }
+
+    #[test]
+    fn write_sqlite_batch_preserves_event_data() {
+        let mut conn = setup_test_db();
+        let event = create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Unknown);
+        let batch = vec![event];
+
+        write_sqlite_batch(&mut conn, &batch).expect("batch write failed");
+
+        let (ts, event_type, provider, pid, domain): (String, String, String, i64, String) = conn
+            .query_row(
+                "SELECT ts, event, provider, pid, domain FROM events LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("query failed");
+
+        assert_eq!(ts, "2026-01-20T12:00:00Z");
+        assert_eq!(event_type, "connect");
+        assert_eq!(provider, "unknown");
+        assert_eq!(pid, 1234);
+        assert_eq!(domain, "test.example.com");
+    }
+
+    #[test]
+    fn write_sqlite_batch_stores_duration_for_close() {
+        let mut conn = setup_test_db();
+        let event = create_test_event("2026-01-20T12:00:00Z", "close", Provider::Anthropic);
+        let batch = vec![event];
+
+        write_sqlite_batch(&mut conn, &batch).expect("batch write failed");
+
+        let duration: Option<i64> = conn
+            .query_row("SELECT duration_ms FROM events LIMIT 1", [], |row| row.get(0))
+            .expect("query failed");
+
+        assert_eq!(duration, Some(1000));
+    }
+
+    #[test]
+    fn write_sqlite_batch_multiple_calls_accumulate() {
+        let mut conn = setup_test_db();
+
+        // First batch
+        let batch1 = vec![
+            create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Anthropic),
+        ];
+        write_sqlite_batch(&mut conn, &batch1).expect("batch1 write failed");
+
+        // Second batch
+        let batch2 = vec![
+            create_test_event("2026-01-20T12:00:01Z", "connect", Provider::OpenAI),
+            create_test_event("2026-01-20T12:00:02Z", "close", Provider::Anthropic),
+        ];
+        write_sqlite_batch(&mut conn, &batch2).expect("batch2 write failed");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .expect("count query failed");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn write_sqlite_batch_run_id_consistency() {
+        let mut conn = setup_test_db();
+        let batch = vec![
+            create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Anthropic),
+            create_test_event("2026-01-20T12:00:01Z", "connect", Provider::OpenAI),
+        ];
+
+        write_sqlite_batch(&mut conn, &batch).expect("batch write failed");
+
+        let distinct_run_ids: i64 = conn
+            .query_row("SELECT COUNT(DISTINCT run_id) FROM events", [], |row| row.get(0))
+            .expect("count query failed");
+        assert_eq!(distinct_run_ids, 1);
     }
 }

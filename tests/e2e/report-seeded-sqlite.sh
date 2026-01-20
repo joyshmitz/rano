@@ -221,8 +221,8 @@ e2e_assert_last_status 0
 # Count top_domains entries (count lines with "domain": followed by "events":)
 # The top_domains array entries have format: {"domain": ..., "events": ..., "provider": ...}
 # top_ips entries have: {"ip": ..., "events": ..., "domain": ...}
-# So we look for entries starting with "domain":
-domain_count=$(grep -E '^\s*\{"domain":' "${E2E_LAST_OUTPUT_FILE}" | wc -l)
+# So we look for entries starting with "domain": (use [[:space:]] for portability)
+domain_count=$(grep -E '^[[:space:]]*\{"domain":' "${E2E_LAST_OUTPUT_FILE}" | wc -l)
 if [ "${domain_count}" -gt 2 ]; then
   e2e_fail "Expected max 2 top domains, got ${domain_count}"
 fi
