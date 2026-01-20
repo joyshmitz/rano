@@ -226,6 +226,49 @@ rano update --system
 rano update --owner your-org --repo rano --branch main
 ```
 
+### `rano report`
+
+Generate reports from SQLite event history.
+
+```bash
+# Show latest session report
+rano report --latest
+
+# Show specific session by run_id
+rano report --run-id "12345-1705512345000"
+
+# Filter by time range
+rano report --since 24h                    # Last 24 hours
+rano report --since 7d                     # Last 7 days
+rano report --since 2026-01-17             # Since date
+rano report --since 2026-01-17T10:00:00Z   # Since timestamp
+
+# Combine filters
+rano report --since 2026-01-17 --until 2026-01-18
+
+# Output options
+rano report --latest --json                # JSON output
+rano report --latest --top 5               # Top 5 domains/IPs
+rano report --sqlite /path/to/rano.sqlite  # Custom database
+
+# Color control
+rano report --latest --color always
+```
+
+**Report sections**
+
+- **Session**: run ID, start/end times, duration, host, patterns
+- **Summary**: total events, connects, closes, active connections
+- **Providers**: event counts per provider (anthropic, openai, google, unknown)
+- **Top Domains**: most active domains with provider attribution
+- **Top IPs**: most active remote IPs with reverse DNS
+
+**Time range formats**
+
+- Relative: `1h`, `24h`, `7d`, `30m`, `1w`
+- Date: `2026-01-17` (interpreted as midnight UTC)
+- RFC3339: `2026-01-17T10:00:00Z`
+
 ---
 
 ## Configuration
@@ -269,10 +312,27 @@ no_banner=false
 theme=vivid
 ```
 
-SQLite batching defaults: `db_batch_size=200`, `db_flush_ms=1000`, `db_queue_max=10000`.
-Larger batches reduce write overhead but delay visibility; smaller flush intervals
-reduce latency but increase I/O. Queue max caps memory usage; if it fills, events
-are dropped with a warning.
+### SQLite Batching Performance
+
+SQLite writes use an async batching system for better performance under high event rates.
+
+**Default settings:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `db_batch_size` | 200 | Events per transaction |
+| `db_flush_ms` | 1000 | Maximum time before flush |
+| `db_queue_max` | 10000 | Event queue capacity |
+
+**Tuning guidance:**
+
+- **High event rate** (>500 events/sec): Increase `db_batch_size` to 500-1000, increase `db_queue_max` to 50000
+- **Low latency queries**: Decrease `db_flush_ms` to 100-500
+- **Memory constrained**: Decrease `db_queue_max` to 1000-5000
+- **SSD storage**: Defaults work well
+- **HDD storage**: Increase `db_batch_size` to 500+
+
+If the queue fills, events are dropped with a warning. Monitor for "sqlite queue full" messages.
 
 ---
 
