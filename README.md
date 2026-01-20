@@ -334,6 +334,47 @@ SQLite writes use an async batching system for better performance under high eve
 
 If the queue fills, events are dropped with a warning. Monitor for "sqlite queue full" messages.
 
+### Provider Configuration (`rano.toml`)
+
+Customize provider pattern matching without recompiling. rano searches for config at:
+
+1. `~/.rano.toml`
+2. `~/.config/rano/rano.toml`
+3. `./rano.toml`
+4. `--config-toml <path>` (CLI)
+5. `RANO_CONFIG_TOML` (env)
+
+**Example `rano.toml`:**
+
+```toml
+[providers]
+# "merge" extends defaults; "replace" clears and uses only specified patterns
+mode = "merge"
+
+# Patterns are case-insensitive substrings matched against comm+cmdline
+anthropic = ["acme-claude", "internal-claude"]
+openai = ["company-codex"]
+google = ["corp-gemini"]
+```
+
+**Merge mode (default):** Adds your patterns to the built-in defaults (`claude`, `codex`, `gemini`, etc.).
+
+**Replace mode:** Clears all defaults and uses only your specified patterns. Useful for strict environments.
+
+**Default patterns:**
+
+| Provider | Default patterns |
+|----------|------------------|
+| anthropic | `claude`, `anthropic` |
+| openai | `codex`, `openai` |
+| google | `gemini`, `google` |
+
+**Verification:** Run with `--once` to see provider attribution:
+
+```bash
+rano --pattern myprocess --once 2>&1 | grep provider
+```
+
 ---
 
 ## Architecture
