@@ -3034,9 +3034,13 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     // Check schema
     let has_events = table_exists(&conn, "events")?;
     if !has_events {
-        return Err("Database does not contain rano event data (missing events table)".to_string());
+        return Err(format!(
+            "Database does not contain rano event data (missing events table). {}",
+            schema_hint(&args.sqlite_path)
+        ));
     }
     let has_sessions = table_exists(&conn, "sessions")?;
+    check_report_schema(&conn, &args.sqlite_path, has_sessions)?;
 
     let color_enabled = resolve_color_mode(args.color);
 
@@ -3081,6 +3085,92 @@ fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, String> {
         .query_row(sql, [table_name], |row| row.get(0))
         .ok();
     Ok(result.is_some())
+}
+
+fn view_exists(conn: &Connection, view_name: &str) -> Result<bool, String> {
+    let sql = "SELECT name FROM sqlite_master WHERE type='view' AND name=?";
+    let result: Option<String> = conn
+        .query_row(sql, [view_name], |row| row.get(0))
+        .ok();
+    Ok(result.is_some())
+}
+
+fn column_exists(conn: &Connection, table_name: &str, column: &str) -> Result<bool, String> {
+    let pragma = format!("PRAGMA table_info({})", table_name);
+    let mut stmt = conn
+        .prepare(&pragma)
+        .map_err(|e| format!("Failed to inspect schema: {}", e))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| format!("Failed to read schema: {}", e))?;
+    while let Some(row) = rows.next().map_err(|e| format!("Failed to read schema: {}", e))? {
+        let name: String = row.get(1).map_err(|e| format!("Failed to read schema: {}", e))?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn check_report_schema(
+    conn: &Connection,
+    sqlite_path: &str,
+    has_sessions: bool,
+) -> Result<(), String> {
+    let required_columns = ["ts", "event", "provider", "remote_ip", "domain", "run_id"];
+    let mut missing_cols = Vec::new();
+    for col in required_columns.iter() {
+        if !column_exists(conn, "events", col)? {
+            missing_cols.push(*col);
+        }
+    }
+    if !missing_cols.is_empty() {
+        return Err(format!(
+            "Database schema missing columns in events table: {}. {}",
+            missing_cols.join(", "),
+            schema_hint(sqlite_path)
+        ));
+    }
+
+    if !has_sessions {
+        eprintln!(
+            "warning: sessions table missing; session metadata will be unavailable. {}",
+            schema_hint(sqlite_path)
+        );
+    }
+
+    let expected_views = [
+        "provider_counts",
+        "provider_domains",
+        "provider_ips",
+        "provider_ports",
+        "provider_processes",
+        "provider_last_hour",
+        "provider_hourly",
+        "session_summary",
+    ];
+    let mut missing_views = Vec::new();
+    for view in expected_views.iter() {
+        if !view_exists(conn, view)? {
+            missing_views.push(*view);
+        }
+    }
+    if !missing_views.is_empty() {
+        eprintln!(
+            "warning: missing sqlite views ({}). Report will use fallback queries where possible. {}",
+            missing_views.join(", "),
+            schema_hint(sqlite_path)
+        );
+    }
+
+    Ok(())
+}
+
+fn schema_hint(sqlite_path: &str) -> String {
+    format!(
+        "To regenerate the schema, run: rano --once --sqlite {} (with the current binary).",
+        sqlite_path
+    )
 }
 
 fn find_latest_session(conn: &Connection) -> Result<Option<String>, String> {
@@ -3193,6 +3283,9 @@ fn output_report_json(
                 if let Some(host) = &session.host {
                     out.push_str(&format!("    \"host\": \"{}\",\n", host));
                 }
+                if let Some(user) = &session.user {
+                    out.push_str(&format!("    \"user\": \"{}\",\n", user));
+                }
                 if let Some(patterns) = &session.patterns {
                     out.push_str(&format!("    \"patterns\": \"{}\",\n", patterns));
                 }
@@ -3274,6 +3367,15 @@ fn output_report_pretty(
     println!("\n{}", if color { "\x1b[1mrano report\x1b[0m" } else { "rano report" });
     println!("{}", "=".repeat(60));
 
+    // Time range (if provided)
+    if filter.since.is_some() || filter.until.is_some() {
+        let now_display = now_rfc3339();
+        let since = filter.since.as_deref().unwrap_or("beginning");
+        let until = filter.until.as_deref().unwrap_or(&now_display);
+        println!("\n{}", if color { "\x1b[1;36mRange\x1b[0m" } else { "Range" });
+        println!("  {} .. {}", since, until);
+    }
+
     // Session info
     if has_sessions {
         if let Some(ref run_id) = filter.run_id {
@@ -3283,9 +3385,16 @@ fn output_report_pretty(
                 println!("  Started:  {}", session.start_ts);
                 if let Some(end) = &session.end_ts {
                     println!("  Ended:    {}", end);
+                    // Calculate and display duration
+                    if let Some(duration) = format_session_duration(&session.start_ts, end) {
+                        println!("  Duration: {}", duration);
+                    }
                 }
                 if let Some(host) = &session.host {
                     println!("  Host:     {}", host);
+                }
+                if let Some(user) = &session.user {
+                    println!("  User:     {}", user);
                 }
                 if let Some(patterns) = &session.patterns {
                     println!("  Patterns: {}", patterns);
@@ -3305,26 +3414,62 @@ fn output_report_pretty(
     let providers = query_providers(conn, filter)?;
     if !providers.is_empty() {
         println!("\n{}", if color { "\x1b[1;36mProviders\x1b[0m" } else { "Providers" });
-        let max_events = providers.iter().map(|p| p.events).max().unwrap_or(1);
+        let provider_width = providers
+            .iter()
+            .map(|p| p.provider.len())
+            .max()
+            .unwrap_or(8)
+            .max("Provider".len());
+        let events_width = providers
+            .iter()
+            .map(|p| p.events.to_string().len())
+            .max()
+            .unwrap_or(6)
+            .max("Events".len());
+        let connects_width = providers
+            .iter()
+            .map(|p| p.connects.to_string().len())
+            .max()
+            .unwrap_or(8)
+            .max("Connects".len());
+        let closes_width = providers
+            .iter()
+            .map(|p| p.closes.to_string().len())
+            .max()
+            .unwrap_or(6)
+            .max("Closes".len());
+
+        println!(
+            "  {:<provider_width$}  {:>events_width$}  {:>connects_width$}  {:>closes_width$}",
+            "Provider",
+            "Events",
+            "Connects",
+            "Closes",
+            provider_width = provider_width,
+            events_width = events_width,
+            connects_width = connects_width,
+            closes_width = closes_width
+        );
+        println!(
+            "  {}  {}  {}  {}",
+            "-".repeat(provider_width),
+            "-".repeat(events_width),
+            "-".repeat(connects_width),
+            "-".repeat(closes_width)
+        );
         for p in &providers {
-            let bar_width = 20;
-            let filled = if max_events > 0 {
-                (p.events as f64 / max_events as f64 * bar_width as f64) as usize
-            } else {
-                0
-            };
-            let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-            let provider_colored = if color {
-                match p.provider.as_str() {
-                    "anthropic" => format!("\x1b[35m{}\x1b[0m", p.provider),
-                    "openai" => format!("\x1b[92m{}\x1b[0m", p.provider),
-                    "google" => format!("\x1b[94m{}\x1b[0m", p.provider),
-                    _ => format!("\x1b[90m{}\x1b[0m", p.provider),
-                }
-            } else {
-                p.provider.clone()
-            };
-            println!("  {:12} │ {} │ {:>6} events", provider_colored, bar, p.events);
+            let label = provider_label(&p.provider, color);
+            let label = pad_right(&label, provider_width, p.provider.len());
+            println!(
+                "  {}  {:>events_width$}  {:>connects_width$}  {:>closes_width$}",
+                label,
+                p.events,
+                p.connects,
+                p.closes,
+                events_width = events_width,
+                connects_width = connects_width,
+                closes_width = closes_width
+            );
         }
     }
 
@@ -3332,8 +3477,49 @@ fn output_report_pretty(
     let domains = query_top_domains(conn, filter, top)?;
     if !domains.is_empty() {
         println!("\n{}", if color { "\x1b[1;36mTop Domains\x1b[0m" } else { "Top Domains" });
+        let provider_width = domains
+            .iter()
+            .map(|d| d.provider.len())
+            .max()
+            .unwrap_or(8)
+            .max("Provider".len());
+        let events_width = domains
+            .iter()
+            .map(|d| d.events.to_string().len())
+            .max()
+            .unwrap_or(6)
+            .max("Events".len());
+        let domain_width = 48usize;
+        println!(
+            "  {:>2}  {:<domain_width$}  {:>events_width$}  {:<provider_width$}",
+            "#",
+            "Domain",
+            "Events",
+            "Provider",
+            domain_width = domain_width,
+            events_width = events_width,
+            provider_width = provider_width
+        );
+        println!(
+            "  {}  {}  {}  {}",
+            "-".repeat(2),
+            "-".repeat(domain_width),
+            "-".repeat(events_width),
+            "-".repeat(provider_width)
+        );
         for (i, d) in domains.iter().enumerate() {
-            println!("  {:2}. {:40} {:>6} events  [{}]", i + 1, d.domain, d.events, d.provider);
+            let domain = truncate_ascii(&d.domain, domain_width);
+            let provider = provider_label(&d.provider, color);
+            let provider = pad_right(&provider, provider_width, d.provider.len());
+            println!(
+                "  {:>2}  {:<domain_width$}  {:>events_width$}  {}",
+                i + 1,
+                domain,
+                d.events,
+                provider,
+                domain_width = domain_width,
+                events_width = events_width
+            );
         }
     }
 
@@ -3341,14 +3527,142 @@ fn output_report_pretty(
     let ips = query_top_ips(conn, filter, top)?;
     if !ips.is_empty() {
         println!("\n{}", if color { "\x1b[1;36mTop IPs\x1b[0m" } else { "Top IPs" });
+        let events_width = ips
+            .iter()
+            .map(|ip| ip.events.to_string().len())
+            .max()
+            .unwrap_or(6)
+            .max("Events".len());
+        let ip_width = 39usize;
+        let domain_width = 32usize;
+        println!(
+            "  {:>2}  {:<ip_width$}  {:>events_width$}  {:<domain_width$}",
+            "#",
+            "IP",
+            "Events",
+            "Domain",
+            ip_width = ip_width,
+            events_width = events_width,
+            domain_width = domain_width
+        );
+        println!(
+            "  {}  {}  {}  {}",
+            "-".repeat(2),
+            "-".repeat(ip_width),
+            "-".repeat(events_width),
+            "-".repeat(domain_width)
+        );
         for (i, ip) in ips.iter().enumerate() {
             let domain = ip.domain.as_deref().unwrap_or("unknown");
-            println!("  {:2}. {:20} {:>6} events  ({})", i + 1, ip.ip, ip.events, domain);
+            let domain = truncate_ascii(domain, domain_width);
+            let ip_value = truncate_ascii(&ip.ip, ip_width);
+            println!(
+                "  {:>2}  {:<ip_width$}  {:>events_width$}  {:<domain_width$}",
+                i + 1,
+                ip_value,
+                ip.events,
+                domain,
+                ip_width = ip_width,
+                events_width = events_width,
+                domain_width = domain_width
+            );
         }
     }
 
     println!();
     Ok(())
+}
+
+fn provider_label(provider: &str, color: bool) -> String {
+    if !color {
+        return provider.to_string();
+    }
+    match provider {
+        "anthropic" => format!("\x1b[35m{}\x1b[0m", provider),
+        "openai" => format!("\x1b[92m{}\x1b[0m", provider),
+        "google" => format!("\x1b[94m{}\x1b[0m", provider),
+        _ => format!("\x1b[90m{}\x1b[0m", provider),
+    }
+}
+
+fn pad_right(value: &str, width: usize, visible_len: usize) -> String {
+    if width <= visible_len {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + (width - visible_len));
+    out.push_str(value);
+    out.push_str(&" ".repeat(width - visible_len));
+    out
+}
+
+fn truncate_ascii(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    if max <= 3 {
+        return value.chars().take(max).collect();
+    }
+    let head = max - 3;
+    let mut out = String::with_capacity(max);
+    out.push_str(&value[..head]);
+    out.push_str("...");
+    out
+}
+
+/// Calculate duration between two RFC3339 timestamps and format as human-readable
+fn format_session_duration(start: &str, end: &str) -> Option<String> {
+    let start_secs = parse_rfc3339_secs(start)?;
+    let end_secs = parse_rfc3339_secs(end)?;
+    if end_secs < start_secs {
+        return None;
+    }
+    let diff = end_secs - start_secs;
+    Some(format_duration_human(diff))
+}
+
+/// Parse RFC3339 timestamp to Unix seconds (simplified)
+fn parse_rfc3339_secs(ts: &str) -> Option<u64> {
+    // Format: 2026-01-17T12:34:56Z or 2026-01-17T12:34:56.123Z
+    if ts.len() < 19 {
+        return None;
+    }
+    let year: i32 = ts.get(0..4)?.parse().ok()?;
+    let month: u32 = ts.get(5..7)?.parse().ok()?;
+    let day: u32 = ts.get(8..10)?.parse().ok()?;
+    let hour: u32 = ts.get(11..13)?.parse().ok()?;
+    let min: u32 = ts.get(14..16)?.parse().ok()?;
+    let sec: u32 = ts.get(17..19)?.parse().ok()?;
+
+    // Days since epoch using a simplified Gregorian calculation
+    let y = if month <= 2 { year - 1 } else { year } as i64;
+    let m = if month <= 2 { month + 12 } else { month } as i64;
+    let d = day as i64;
+    let days = 365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + d - 719528;
+
+    Some((days as u64) * 86400 + (hour as u64) * 3600 + (min as u64) * 60 + (sec as u64))
+}
+
+/// Format seconds into human-readable duration (e.g., "1h 25m 4s")
+fn format_duration_human(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{}s", secs);
+    }
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let s = secs % 60;
+    if hours > 0 {
+        if s > 0 {
+            format!("{}h {}m {}s", hours, mins, s)
+        } else if mins > 0 {
+            format!("{}h {}m", hours, mins)
+        } else {
+            format!("{}h", hours)
+        }
+    } else if s > 0 {
+        format!("{}m {}s", mins, s)
+    } else {
+        format!("{}m", mins)
+    }
 }
 
 // Report query helper structs
@@ -3357,6 +3671,7 @@ struct SessionInfo {
     start_ts: String,
     end_ts: Option<String>,
     host: Option<String>,
+    user: Option<String>,
     patterns: Option<String>,
     connects: Option<i64>,
     closes: Option<i64>,
@@ -3388,7 +3703,7 @@ struct IpStats {
 }
 
 fn query_session(conn: &Connection, run_id: &str) -> Result<Option<SessionInfo>, String> {
-    let sql = "SELECT run_id, start_ts, end_ts, host, patterns, connects, closes
+    let sql = "SELECT run_id, start_ts, end_ts, host, user, patterns, connects, closes
                FROM sessions WHERE run_id = ?";
     match conn.query_row(sql, [run_id], |row| {
         Ok(SessionInfo {
@@ -3396,9 +3711,10 @@ fn query_session(conn: &Connection, run_id: &str) -> Result<Option<SessionInfo>,
             start_ts: row.get(1)?,
             end_ts: row.get(2).ok(),
             host: row.get(3).ok(),
-            patterns: row.get(4).ok(),
-            connects: row.get(5).ok(),
-            closes: row.get(6).ok(),
+            user: row.get(4).ok(),
+            patterns: row.get(5).ok(),
+            connects: row.get(6).ok(),
+            closes: row.get(7).ok(),
         })
     }) {
         Ok(s) => Ok(Some(s)),
@@ -3948,5 +4264,65 @@ mod tests {
             provider_from_text("beta-runner", "", &matcher),
             Provider::OpenAI
         );
+    }
+
+    #[test]
+    fn build_summary_query_includes_filters() {
+        let filter = ReportFilter {
+            run_id: Some("run-1".to_string()),
+            since: Some("2026-01-01T00:00:00Z".to_string()),
+            until: Some("2026-01-02T00:00:00Z".to_string()),
+        };
+        let (sql, params) = build_summary_query(&filter);
+        assert!(sql.contains("run_id = ?"));
+        assert!(sql.contains("ts >= ?"));
+        assert!(sql.contains("ts < ?"));
+        assert_eq!(
+            params,
+            vec![
+                "run-1".to_string(),
+                "2026-01-01T00:00:00Z".to_string(),
+                "2026-01-02T00:00:00Z".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn build_domains_query_limits_and_filters() {
+        let filter = ReportFilter {
+            run_id: Some("run-2".to_string()),
+            since: None,
+            until: None,
+        };
+        let (sql, params) = build_domains_query(&filter, 5);
+        assert!(sql.contains("run_id = ?"));
+        assert!(sql.contains("LIMIT 5"));
+        assert_eq!(params, vec!["run-2".to_string()]);
+    }
+
+    #[test]
+    fn parse_time_filter_accepts_rfc3339_and_date() {
+        let rfc = Some("2026-01-17T12:00:00Z".to_string());
+        let parsed = parse_time_filter(&rfc).expect("rfc3339 should parse");
+        assert_eq!(parsed, Some("2026-01-17T12:00:00Z".to_string()));
+
+        let date = Some("2026-01-17".to_string());
+        let parsed = parse_time_filter(&date).expect("date should parse");
+        assert_eq!(parsed, Some("2026-01-17T00:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn parse_time_filter_accepts_relative() {
+        let rel = Some("1h".to_string());
+        let parsed = parse_time_filter(&rel).expect("relative should parse");
+        let value = parsed.expect("relative should return value");
+        assert!(value.contains('T'));
+        assert!(value.ends_with('Z'));
+    }
+
+    #[test]
+    fn parse_time_filter_rejects_invalid() {
+        let invalid = Some("not-a-time".to_string());
+        assert!(parse_time_filter(&invalid).is_err());
     }
 }
