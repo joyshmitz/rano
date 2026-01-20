@@ -85,6 +85,9 @@ struct MonitorArgs {
     color: ColorMode,
     sqlite_path: String,
     no_sqlite: bool,
+    db_batch_size: usize,
+    db_flush_ms: u64,
+    db_queue_max: usize,
     stats_interval_ms: u64,
     stats_width: usize,
     stats_top: usize,
@@ -114,6 +117,9 @@ impl Default for MonitorArgs {
             color: ColorMode::Auto,
             sqlite_path: "observer.sqlite".to_string(),
             no_sqlite: false,
+            db_batch_size: SQLITE_BATCH_SIZE,
+            db_flush_ms: SQLITE_FLUSH_INTERVAL_MS,
+            db_queue_max: SQLITE_QUEUE_CAPACITY,
             stats_interval_ms: 5000,
             stats_width: 40,
             stats_top: 5,
@@ -539,7 +545,7 @@ fn main() {
     let sqlite_writer = if args.no_sqlite {
         None
     } else {
-        start_sqlite_writer(&args.sqlite_path, run_ctx.clone(), log_writer.clone())
+        start_sqlite_writer(&args, run_ctx.clone(), log_writer.clone())
     };
 
     if !args.no_banner {
@@ -913,6 +919,33 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 args.no_sqlite = true;
                 i += 1;
             }
+            "--db-batch-size" => {
+                i += 1;
+                let value = require_value(argv, i, "--db-batch-size")?;
+                args.db_batch_size = parse_usize(value, "--db-batch-size")?;
+                if args.db_batch_size == 0 {
+                    return Err("--db-batch-size must be >= 1".to_string());
+                }
+                i += 1;
+            }
+            "--db-flush-ms" => {
+                i += 1;
+                let value = require_value(argv, i, "--db-flush-ms")?;
+                args.db_flush_ms = parse_u64(value, "--db-flush-ms")?;
+                if args.db_flush_ms == 0 {
+                    return Err("--db-flush-ms must be >= 1".to_string());
+                }
+                i += 1;
+            }
+            "--db-queue-max" => {
+                i += 1;
+                let value = require_value(argv, i, "--db-queue-max")?;
+                args.db_queue_max = parse_usize(value, "--db-queue-max")?;
+                if args.db_queue_max == 0 {
+                    return Err("--db-queue-max must be >= 1".to_string());
+                }
+                i += 1;
+            }
             "--stats-interval-ms" => {
                 i += 1;
                 let value = require_value(argv, i, "--stats-interval-ms")?;
@@ -1202,6 +1235,24 @@ fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> 
             "color" => args.color = parse_color_mode(value)?,
             "sqlite" => args.sqlite_path = value.to_string(),
             "no_sqlite" => args.no_sqlite = parse_bool(value)?,
+            "db_batch_size" => {
+                args.db_batch_size = parse_usize(value, "db_batch_size")?;
+                if args.db_batch_size == 0 {
+                    return Err("db_batch_size must be >= 1".to_string());
+                }
+            }
+            "db_flush_ms" => {
+                args.db_flush_ms = parse_u64(value, "db_flush_ms")?;
+                if args.db_flush_ms == 0 {
+                    return Err("db_flush_ms must be >= 1".to_string());
+                }
+            }
+            "db_queue_max" => {
+                args.db_queue_max = parse_usize(value, "db_queue_max")?;
+                if args.db_queue_max == 0 {
+                    return Err("db_queue_max must be >= 1".to_string());
+                }
+            }
             "stats_interval_ms" => args.stats_interval_ms = parse_u64(value, "stats_interval_ms")?,
             "stats_width" => args.stats_width = parse_usize(value, "stats_width")?,
             "stats_top" => args.stats_top = parse_usize(value, "stats_top")?,
@@ -1428,7 +1479,7 @@ fn parse_provider_mode(value: &str) -> Result<ProviderMode, String> {
 
 fn print_help() {
     println!(
-        "rano - AI CLI network observer\n\nUSAGE:\n  rano [options]\n  rano update [options]\n\nOPTIONS:\n  --pattern <str>           Process name or cmdline substring to match (repeatable)\n  --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n  --pid <pid>               Monitor a specific PID (repeatable)\n  --no-descendants          Do not include descendant processes\n  --interval-ms <ms>        Poll interval (default: 1000)\n  --json                    Emit JSON lines to stdout\n  --summary-only            Suppress live events, show summary only\n  --domain-mode <mode>      auto|ptr|pcap (default: auto)\n  --pcap                    Force pcap mode (falls back with warning)\n  --no-dns                  Disable PTR lookups\n  --include-udp             Include UDP sockets (default: true)\n  --no-udp                  Disable UDP sockets\n  --include-listening       Include listening TCP sockets\n  --log-file <path>         Append output to log file\n  --log-dir <path>          Write per-run log files into directory\n  --log-format <fmt>        auto|pretty|json for log files (default: auto)\n  --once                    Emit a single poll and exit\n  --color <mode>            auto|always|never (default: auto)\n  --no-color                Disable ANSI color\n  --theme <name>            vivid|mono (default: vivid)\n  --sqlite <path>           SQLite file for persistent logging\n  --no-sqlite               Disable SQLite logging\n  --stats-interval-ms <ms>  Live stats interval (0 disables)\n  --stats-width <n>         ASCII bar width\n  --stats-top <n>           Top-N domains/IPs in stats/summary\n  --no-banner               Suppress startup banner\n  --config <path>           Load config file (key=value format)\n  --config-toml <path>      Load provider config (TOML)\n  --no-config               Ignore config files\n  -h, --help                Show this help\n  -V, --version             Show version\n"
+        "rano - AI CLI network observer\n\nUSAGE:\n  rano [options]\n  rano update [options]\n\nOPTIONS:\n  --pattern <str>           Process name or cmdline substring to match (repeatable)\n  --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n  --pid <pid>               Monitor a specific PID (repeatable)\n  --no-descendants          Do not include descendant processes\n  --interval-ms <ms>        Poll interval (default: 1000)\n  --json                    Emit JSON lines to stdout\n  --summary-only            Suppress live events, show summary only\n  --domain-mode <mode>      auto|ptr|pcap (default: auto)\n  --pcap                    Force pcap mode (falls back with warning)\n  --no-dns                  Disable PTR lookups\n  --include-udp             Include UDP sockets (default: true)\n  --no-udp                  Disable UDP sockets\n  --include-listening       Include listening TCP sockets\n  --log-file <path>         Append output to log file\n  --log-dir <path>          Write per-run log files into directory\n  --log-format <fmt>        auto|pretty|json for log files (default: auto)\n  --once                    Emit a single poll and exit\n  --color <mode>            auto|always|never (default: auto)\n  --no-color                Disable ANSI color\n  --theme <name>            vivid|mono (default: vivid)\n  --sqlite <path>           SQLite file for persistent logging\n  --no-sqlite               Disable SQLite logging\n  --db-batch-size <n>       SQLite batch size (events per transaction)\n  --db-flush-ms <ms>        SQLite flush interval in ms\n  --db-queue-max <n>        SQLite queue capacity (events)\n  --stats-interval-ms <ms>  Live stats interval (0 disables)\n  --stats-width <n>         ASCII bar width\n  --stats-top <n>           Top-N domains/IPs in stats/summary\n  --no-banner               Suppress startup banner\n  --config <path>           Load config file (key=value format)\n  --config-toml <path>      Load provider config (TOML)\n  --no-config               Ignore config files\n  -h, --help                Show this help\n  -V, --version             Show version\n"
     );
 }
 
@@ -2077,17 +2128,20 @@ fn open_log_writer(
 }
 
 fn start_sqlite_writer(
-    sqlite_path: &str,
+    args: &MonitorArgs,
     run_ctx: RunContext,
     log_writer: Option<Arc<LogWriter>>,
 ) -> Option<SqliteWriter> {
-    let (sender, receiver) = mpsc::sync_channel(SQLITE_QUEUE_CAPACITY);
+    let queue_max = args.db_queue_max;
+    let batch_size = args.db_batch_size;
+    let flush_ms = args.db_flush_ms;
+    let (sender, receiver) = mpsc::sync_channel(queue_max);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let dropped_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let log_clone = log_writer.clone();
-    let path = sqlite_path.to_string();
+    let path = args.sqlite_path.to_string();
     let handle = std::thread::spawn(move || {
-        sqlite_writer_loop(path, run_ctx, receiver, ready_tx, log_clone);
+        sqlite_writer_loop(path, run_ctx, receiver, ready_tx, log_clone, batch_size, flush_ms);
     });
 
     let start_result = match ready_rx.recv() {
@@ -2126,6 +2180,8 @@ fn sqlite_writer_loop(
     receiver: Receiver<SqliteMsg>,
     ready_tx: SyncSender<Result<(), String>>,
     log_writer: Option<Arc<LogWriter>>,
+    batch_size: usize,
+    flush_ms: u64,
 ) {
     let mut conn = match Connection::open(&sqlite_path) {
         Ok(conn) => conn,
@@ -2147,9 +2203,9 @@ fn sqlite_writer_loop(
 
     let _ = ready_tx.send(Ok(()));
 
-    let mut batch: Vec<SqliteEvent> = Vec::with_capacity(SQLITE_BATCH_SIZE);
+    let mut batch: Vec<SqliteEvent> = Vec::with_capacity(batch_size);
     let mut last_flush = SystemTime::now();
-    let flush_interval = Duration::from_millis(SQLITE_FLUSH_INTERVAL_MS);
+    let flush_interval = Duration::from_millis(flush_ms);
     let mut shutdown: Option<(String, u64, u64)> = None;
 
     loop {
@@ -2170,7 +2226,7 @@ fn sqlite_writer_loop(
         }
 
         let now = SystemTime::now();
-        if batch.len() >= SQLITE_BATCH_SIZE
+        if batch.len() >= batch_size
             || now
                 .duration_since(last_flush)
                 .map(|d| d >= flush_interval)
