@@ -5,6 +5,8 @@ use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "pcap")]
+use std::env;
+#[cfg(feature = "pcap")]
 use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(feature = "pcap")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -218,27 +220,63 @@ pub fn pcap_supported() -> bool {
 pub fn start_pcap_capture() -> Result<PcapHandle, String> {
     use pcap::{Capture, Device};
 
-    let device = Device::lookup()
-        .map_err(|e| format!("pcap device lookup failed: {e}"))?
-        .ok_or_else(|| "no default pcap device found".to_string())?;
-    let mut cap = Capture::from_device(device)
-        .map_err(|e| format!("pcap device open failed: {e}"))?
-        .promisc(true)
-        .immediate_mode(true)
-        .open()
-        .map_err(|e| format!("pcap capture open failed: {e}"))?;
+    let offline_path = env::var("RANO_PCAP_FILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let mut cap = if let Some(path) = offline_path.as_ref() {
+        Capture::from_file(path).map_err(|e| format!("pcap file open failed: {e}"))?
+    } else {
+        let device = Device::lookup()
+            .map_err(|e| format!("pcap device lookup failed: {e}"))?
+            .ok_or_else(|| "no default pcap device found".to_string())?;
+        Capture::from_device(device)
+            .map_err(|e| format!("pcap device open failed: {e}"))?
+            .promisc(true)
+            .immediate_mode(true)
+            .open()
+            .map_err(|e| format!("pcap capture open failed: {e}"))?
+    };
 
     cap.filter("udp port 53 or tcp port 53 or tcp port 443", true)
         .map_err(|e| format!("pcap filter failed: {e}"))?;
 
-    let mut cap = cap
-        .setnonblock()
-        .map_err(|e| format!("pcap nonblock failed: {e}"))?;
+    let is_offline = offline_path.is_some();
+    if !is_offline {
+        cap = cap
+            .setnonblock()
+            .map_err(|e| format!("pcap nonblock failed: {e}"))?;
+    }
 
     let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = stop.clone();
 
+    if is_offline {
+        loop {
+            match cap.next_packet() {
+                Ok(packet) => {
+                    if let Some(tp) = parse_transport_packet(packet.data) {
+                        handle_transport_packet(tp, &sender);
+                    }
+                }
+                Err(pcap::Error::NoMorePackets) => {
+                    break;
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+
+        return Ok(PcapHandle {
+            receiver,
+            stop,
+            handle: None,
+        });
+    }
+
+    let stop_thread = stop.clone();
     let handle = std::thread::spawn(move || loop {
         if stop_thread.load(Ordering::SeqCst) {
             break;
@@ -251,6 +289,9 @@ pub fn start_pcap_capture() -> Result<PcapHandle, String> {
             }
             Err(pcap::Error::TimeoutExpired) => {
                 std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(pcap::Error::NoMorePackets) => {
+                break;
             }
             Err(_) => {
                 std::thread::sleep(Duration::from_millis(50));
