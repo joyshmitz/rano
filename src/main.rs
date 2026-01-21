@@ -17,6 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod config_validation;
 mod pcap_capture;
 
+use config_validation::{validate_config_file, validate_toml_config, ConfigValidator};
+
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 const SQLITE_QUEUE_CAPACITY: usize = 10_000;
@@ -69,6 +71,19 @@ enum Command {
     Update(UpdateCommand),
     Report(ReportArgs),
     Export(ExportArgs),
+    Config(ConfigArgs),
+}
+
+#[derive(Clone, Debug)]
+struct ConfigArgs {
+    subcommand: ConfigSubcommand,
+}
+
+#[derive(Clone, Debug)]
+enum ConfigSubcommand {
+    Check,
+    Show { json: bool },
+    Paths,
 }
 
 #[derive(Clone, Debug)]
@@ -1098,6 +1113,10 @@ fn main() {
                 }
                 return;
             }
+            Command::Config(config_args) => {
+                let exit_code = run_config(config_args);
+                std::process::exit(exit_code);
+            }
         }
     }
 
@@ -1539,6 +1558,13 @@ fn parse_cli() -> Result<Cli, String> {
             let export = parse_export_args(&args[2..])?;
             Ok(Cli {
                 command: Some(Command::Export(export)),
+                monitor: MonitorArgs::default(),
+            })
+        }
+        "config" => {
+            let config = parse_config_args(&args[2..])?;
+            Ok(Cli {
+                command: Some(Command::Config(config)),
                 monitor: MonitorArgs::default(),
             })
         }
@@ -2034,6 +2060,41 @@ fn parse_report_args(argv: &[String]) -> Result<ReportArgs, String> {
     }
 
     Ok(args)
+}
+
+fn parse_config_args(argv: &[String]) -> Result<ConfigArgs, String> {
+    for arg in argv {
+        if arg == "-h" || arg == "--help" {
+            print_config_help();
+            std::process::exit(0);
+        }
+        if arg == "-V" || arg == "--version" {
+            print_version();
+            std::process::exit(0);
+        }
+    }
+
+    if argv.is_empty() {
+        print_config_help();
+        std::process::exit(0);
+    }
+
+    let subcommand = match argv[0].as_str() {
+        "check" => ConfigSubcommand::Check,
+        "show" => {
+            let json = argv.iter().any(|a| a == "--json");
+            ConfigSubcommand::Show { json }
+        }
+        "paths" => ConfigSubcommand::Paths,
+        other => {
+            return Err(format!(
+                "Unknown config subcommand: '{}'. Use 'rano config --help' for usage.",
+                other
+            ));
+        }
+    };
+
+    Ok(ConfigArgs { subcommand })
 }
 
 fn parse_export_args(argv: &[String]) -> Result<ExportArgs, String> {
@@ -2613,8 +2674,8 @@ fn parse_provider_mode(value: &str) -> Result<ProviderMode, String> {
 fn print_help() {
     println!(
         "rano - AI CLI network observer\n\n\
-USAGE:\n  rano [options]\n  rano report [options]\n  rano export [options]\n  rano update [options]\n\n\
-COMMANDS:\n  report    Query SQLite event history (use --help for details)\n  export    Export SQLite event history\n  update    Update the rano binary\n\n\
+USAGE:\n  rano [options]\n  rano report [options]\n  rano export [options]\n  rano config <subcommand>\n  rano update [options]\n\n\
+COMMANDS:\n  report    Query SQLite event history (use --help for details)\n  export    Export SQLite event history\n  config    Validate and inspect configuration\n  update    Update the rano binary\n\n\
 OPTIONS:\n\
   --pattern <str>           Process name or cmdline substring to match (repeatable)\n\
   --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n\
@@ -2724,6 +2785,25 @@ EXAMPLES:\n\
   rano export --format csv\n\
   rano export --format jsonl --since 24h\n\
   rano export --format csv --fields ts,provider,remote_ip,domain\n"
+    );
+}
+
+fn print_config_help() {
+    println!(
+        "rano config - validate and inspect configuration\n\n\
+USAGE:\n  rano config <subcommand> [options]\n\n\
+SUBCOMMANDS:\n\
+  check             Validate all configuration files\n\
+  show [--json]     Display resolved configuration\n\
+  paths             Show config file search locations\n\n\
+OPTIONS:\n\
+  -h, --help        Show this help\n\
+  -V, --version     Show version\n\n\
+EXAMPLES:\n\
+  rano config check                # Validate all config files\n\
+  rano config show                 # Show resolved config\n\
+  rano config show --json          # Show config as JSON\n\
+  rano config paths                # List config search paths\n"
     );
 }
 
@@ -4613,6 +4693,150 @@ enum FieldValue {
     String(String),
     Integer(i64),
     Null,
+}
+
+// ============================================================================
+// Config subcommand implementation
+// ============================================================================
+
+fn run_config(args: ConfigArgs) -> i32 {
+    match args.subcommand {
+        ConfigSubcommand::Check => run_config_check(),
+        ConfigSubcommand::Show { json } => run_config_show(json),
+        ConfigSubcommand::Paths => run_config_paths(),
+    }
+}
+
+fn run_config_check() -> i32 {
+    use config_validation::{validate_config_file, validate_toml_config, ConfigValidator};
+
+    let mut validator = ConfigValidator::new();
+    let mut checked_any = false;
+
+    // Check key-value config file
+    if let Some(kv_path) = default_config_path() {
+        if kv_path.exists() {
+            checked_any = true;
+            validator.validate_config_file(&kv_path);
+        }
+    }
+
+    // Check TOML config files
+    for toml_path in default_provider_config_paths() {
+        if toml_path.exists() {
+            checked_any = true;
+            validator.validate_toml_config(&toml_path);
+        }
+    }
+
+    if !checked_any {
+        println!("No configuration files found.");
+        println!("Use 'rano config paths' to see search locations.");
+        return 0;
+    }
+
+    println!("{}", validator.summary());
+
+    if validator.is_valid() {
+        0
+    } else {
+        1
+    }
+}
+
+fn run_config_show(json: bool) -> i32 {
+    // Collect all config sources
+    let mut sources: Vec<(String, String)> = Vec::new();
+
+    // Key-value config
+    if let Some(kv_path) = default_config_path() {
+        if kv_path.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&kv_path) {
+                sources.push((kv_path.display().to_string(), contents));
+            }
+        }
+    }
+
+    // TOML config files
+    for toml_path in default_provider_config_paths() {
+        if toml_path.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&toml_path) {
+                sources.push((toml_path.display().to_string(), contents));
+            }
+        }
+    }
+
+    if sources.is_empty() {
+        if json {
+            println!("{{\"sources\": []}}");
+        } else {
+            println!("No configuration files found.");
+            println!("Use 'rano config paths' to see search locations.");
+        }
+        return 0;
+    }
+
+    if json {
+        // Output as JSON
+        let entries: Vec<String> = sources
+            .iter()
+            .map(|(path, contents)| {
+                let escaped_path = path.replace('\\', "\\\\").replace('"', "\\\"");
+                let escaped_contents = contents
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+                    .replace('\t', "\\t");
+                format!(
+                    "{{\"path\": \"{}\", \"contents\": \"{}\"}}",
+                    escaped_path, escaped_contents
+                )
+            })
+            .collect();
+        println!("{{\"sources\": [{}]}}", entries.join(", "));
+    } else {
+        // Pretty print
+        for (path, contents) in &sources {
+            println!("=== {} ===", path);
+            println!("{}", contents);
+            println!();
+        }
+    }
+
+    0
+}
+
+fn run_config_paths() -> i32 {
+    println!("Configuration file search locations:\n");
+
+    // Key-value config paths
+    println!("Key-value config (config.conf):");
+    if let Some(kv_path) = default_config_path() {
+        let exists = kv_path.exists();
+        let marker = if exists { "[found]" } else { "[not found]" };
+        println!("  {} {}", kv_path.display(), marker);
+    }
+
+    println!();
+
+    // TOML provider config paths
+    println!("TOML provider config (rano.toml):");
+    for toml_path in default_provider_config_paths() {
+        let exists = toml_path.exists();
+        let marker = if exists { "[found]" } else { "[not found]" };
+        println!("  {} {}", toml_path.display(), marker);
+    }
+
+    println!();
+
+    // Environment variables
+    println!("Environment variables:");
+    println!("  RANO_CONFIG       Override key-value config path");
+    println!("  RANO_CONFIG_TOML  Override TOML config path");
+    println!("  XDG_CONFIG_HOME   XDG base directory (default: ~/.config)");
+
+    0
 }
 
 struct ExportFilter {
