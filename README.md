@@ -865,12 +865,129 @@ Edit your config:
 no_dns=false
 ```
 
-### "stats aren’t printing"
+### "stats aren't printing"
 
 Stats are suppressed when JSON output is enabled or when `--stats-interval-ms 0`.
 
 ```bash
 rano --stats-interval-ms 2000
+```
+
+---
+
+## Live Stats Views
+
+rano provides four real-time stats views that display aggregated connection data as colorized bar charts. Views can cycle automatically or be displayed individually.
+
+### Available Views
+
+| View | Description | Use Case |
+|------|-------------|----------|
+| `provider` | Connections grouped by AI provider (anthropic, openai, google, unknown) | See which AI services are being used |
+| `domain` | Top domains by connection count | Identify active endpoints |
+| `port` | Top destination ports | Monitor protocol distribution |
+| `process` | Top process names (comm) | See which executables are connecting |
+
+### Quick Examples
+
+```bash
+# Single view - provider stats only
+rano --stats-view provider
+
+# Multiple views - cycle between them
+rano --stats-view provider --stats-view domain --stats-cycle-ms 5000
+
+# All views cycling every 3 seconds
+rano --stats-view provider --stats-view domain --stats-view port --stats-view process --stats-cycle-ms 3000
+
+# Customize display
+rano --stats-view domain --stats-top 10 --stats-width 60 --stats-interval-ms 1000
+```
+
+### Stats Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--stats-view <view>` | provider | View to display (repeatable for cycling) |
+| `--stats-interval-ms <ms>` | 2000 | How often to refresh stats (0 disables) |
+| `--stats-cycle-ms <ms>` | 0 | Cycle between views (0 = no cycling) |
+| `--stats-top <n>` | 5 | Number of items to show in domain/port/process views |
+| `--stats-width <n>` | 40 | Width of bar charts in characters |
+
+### Output Examples
+
+**Provider View** (`--stats-view provider`):
+
+```
+Live Stats [provider]
+  anthropic   █████████████████████████████████████░░░ 42 (domains=3, ips=2)
+  openai      ████████████████░░░░░░░░░░░░░░░░░░░░░░░░ 18 (domains=2, ips=2)
+  google      ██████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 6 (domains=1, ips=1)
+  unknown     ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 0 (domains=0, ips=0)
+  active=12 peak=45 avg_dur=250ms
+```
+
+**Domain View** (`--stats-view domain --stats-top 5`):
+
+```
+Live Stats [domain]
+    42 ████████████████████████████████████████ api.anthropic.com
+    18 █████████████████░░░░░░░░░░░░░░░░░░░░░░░ api.openai.com
+     6 █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ generativelanguage.googleapis.com
+     3 ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ www.google.com
+     1 █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ github.com
+```
+
+**Port View** (`--stats-view port`):
+
+```
+Live Stats [port]
+    65 ████████████████████████████████████████ 443
+     4 ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 80
+     1 █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 8080
+```
+
+**Process View** (`--stats-view process`):
+
+```
+Live Stats [process]
+    35 ████████████████████████████████████████ claude
+    20 ██████████████████████░░░░░░░░░░░░░░░░░░ node
+    10 ███████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ curl
+     5 █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ codex
+```
+
+### E2E Testing
+
+The stats views are tested via the E2E harness:
+
+```bash
+# Run the stats views E2E test
+scripts/e2e/run.sh stats-views tests/e2e/stats-views.sh
+
+# View test output
+cat logs/e2e/stats-views-*.log
+```
+
+The test verifies that all four view types render correctly and cycle in sequence.
+
+### Configuration
+
+Stats settings can be set in `~/.config/rano/config.conf`:
+
+```ini
+stats_interval_ms=1000
+stats_width=50
+stats_top=10
+stats_view=provider,domain
+stats_cycle_ms=5000
+```
+
+Or via presets:
+
+```bash
+# The 'live' preset enables frequent stats
+rano --preset live  # stats_interval_ms=500, stats_top=10
 ```
 
 ### Verify pcap attribution (E2E)

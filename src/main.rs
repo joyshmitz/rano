@@ -7895,4 +7895,304 @@ mod tests {
         assert!(w3.is_some(), "Same endpoint with different PID should trigger at threshold");
         assert_eq!(w3.unwrap().count, 3);
     }
+
+    // ============================================================
+    // Stats Panel Tests - Aggregation and Rendering
+    // ============================================================
+
+    #[test]
+    fn test_top_n_string_sorts_descending_by_count() {
+        let mut map: BTreeMap<String, u64> = BTreeMap::new();
+        map.insert("alpha".to_string(), 10);
+        map.insert("beta".to_string(), 50);
+        map.insert("gamma".to_string(), 30);
+        map.insert("delta".to_string(), 20);
+
+        let result = top_n_string(&map, 4);
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0], ("beta".to_string(), 50));
+        assert_eq!(result[1], ("gamma".to_string(), 30));
+        assert_eq!(result[2], ("delta".to_string(), 20));
+        assert_eq!(result[3], ("alpha".to_string(), 10));
+    }
+
+    #[test]
+    fn test_top_n_string_truncates_to_n() {
+        let mut map: BTreeMap<String, u64> = BTreeMap::new();
+        map.insert("a".to_string(), 100);
+        map.insert("b".to_string(), 90);
+        map.insert("c".to_string(), 80);
+        map.insert("d".to_string(), 70);
+        map.insert("e".to_string(), 60);
+
+        let result = top_n_string(&map, 3);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, "a");
+        assert_eq!(result[1].0, "b");
+        assert_eq!(result[2].0, "c");
+    }
+
+    #[test]
+    fn test_top_n_string_ties_sorted_by_key() {
+        let mut map: BTreeMap<String, u64> = BTreeMap::new();
+        map.insert("zebra".to_string(), 50);
+        map.insert("apple".to_string(), 50);
+        map.insert("mango".to_string(), 50);
+
+        let result = top_n_string(&map, 3);
+
+        // Same count, should sort by key ascending
+        assert_eq!(result[0].0, "apple");
+        assert_eq!(result[1].0, "mango");
+        assert_eq!(result[2].0, "zebra");
+    }
+
+    #[test]
+    fn test_top_n_string_empty_map() {
+        let map: BTreeMap<String, u64> = BTreeMap::new();
+        let result = top_n_string(&map, 5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_top_n_string_with_port_keys() {
+        let mut map: BTreeMap<u16, u64> = BTreeMap::new();
+        map.insert(443, 100);
+        map.insert(80, 80);
+        map.insert(8080, 50);
+
+        let result = top_n_string(&map, 3);
+
+        assert_eq!(result[0], ("443".to_string(), 100));
+        assert_eq!(result[1], ("80".to_string(), 80));
+        assert_eq!(result[2], ("8080".to_string(), 50));
+    }
+
+    #[test]
+    fn test_render_stats_bar_full_bar() {
+        let style = OutputStyle {
+            color: false,
+            theme: Theme::Vivid,
+        };
+        let bar = render_stats_bar(100, 100, 10, style);
+        assert_eq!(bar, "██████████");
+    }
+
+    #[test]
+    fn test_render_stats_bar_half_bar() {
+        let style = OutputStyle {
+            color: false,
+            theme: Theme::Vivid,
+        };
+        let bar = render_stats_bar(50, 100, 10, style);
+        // 50/100 = 0.5, 0.5 * 10 = 5 blocks
+        assert_eq!(bar.trim_end(), "█████");
+    }
+
+    #[test]
+    fn test_render_stats_bar_zero_count() {
+        let style = OutputStyle {
+            color: false,
+            theme: Theme::Vivid,
+        };
+        let bar = render_stats_bar(0, 100, 10, style);
+        // Should be all spaces (width padding)
+        assert_eq!(bar.len(), 10);
+        assert!(bar.chars().all(|c| c == ' '));
+    }
+
+    #[test]
+    fn test_render_stats_bar_zero_width() {
+        let style = OutputStyle {
+            color: false,
+            theme: Theme::Vivid,
+        };
+        let bar = render_stats_bar(50, 100, 0, style);
+        assert!(bar.is_empty());
+    }
+
+    #[test]
+    fn test_render_stats_bar_with_color() {
+        let style = OutputStyle {
+            color: true,
+            theme: Theme::Vivid,
+        };
+        let bar = render_stats_bar(100, 100, 5, style);
+        // Should contain ANSI escape sequences
+        assert!(bar.contains("\x1b["));
+        // Should still have the right block count when stripped
+        let stripped = strip_ansi(&bar);
+        assert_eq!(stripped, "█████");
+    }
+
+    #[test]
+    fn test_strip_ansi_removes_color_codes() {
+        let colored = "\x1b[31mred text\x1b[0m";
+        let stripped = strip_ansi(colored);
+        assert_eq!(stripped, "red text");
+    }
+
+    #[test]
+    fn test_strip_ansi_handles_multiple_codes() {
+        let colored = "\x1b[1;31mbold red\x1b[0m normal \x1b[32mgreen\x1b[0m";
+        let stripped = strip_ansi(colored);
+        assert_eq!(stripped, "bold red normal green");
+    }
+
+    #[test]
+    fn test_strip_ansi_preserves_plain_text() {
+        let plain = "no color codes here";
+        let stripped = strip_ansi(plain);
+        assert_eq!(stripped, plain);
+    }
+
+    #[test]
+    fn test_strip_ansi_empty_string() {
+        let empty = "";
+        let stripped = strip_ansi(empty);
+        assert!(stripped.is_empty());
+    }
+
+    #[test]
+    fn test_paint_no_color_returns_plain() {
+        let result = paint("hello", None, false, false, false);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_paint_with_color() {
+        let result = paint("hello", Some(AnsiColor::Red), false, false, true);
+        assert!(result.starts_with("\x1b["));
+        assert!(result.contains("31")); // Red color code
+        assert!(result.ends_with("\x1b[0m"));
+        assert!(result.contains("hello"));
+    }
+
+    #[test]
+    fn test_paint_with_bold() {
+        let result = paint("hello", None, true, false, true);
+        assert!(result.contains("1m") || result.contains(";1")); // Bold code
+    }
+
+    #[test]
+    fn test_paint_disabled_returns_plain() {
+        let result = paint("hello", Some(AnsiColor::Blue), true, true, false);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_stats_view_parse() {
+        assert_eq!(parse_stats_view("provider"), Ok(StatsView::Provider));
+        assert_eq!(parse_stats_view("domain"), Ok(StatsView::Domain));
+        assert_eq!(parse_stats_view("port"), Ok(StatsView::Port));
+        assert_eq!(parse_stats_view("process"), Ok(StatsView::Process));
+        assert!(parse_stats_view("invalid").is_err());
+    }
+
+    #[test]
+    fn test_provider_label() {
+        assert_eq!(Provider::Anthropic.label(), "anthropic");
+        assert_eq!(Provider::OpenAI.label(), "openai");
+        assert_eq!(Provider::Google.label(), "google");
+        assert_eq!(Provider::Unknown.label(), "unknown");
+    }
+
+    #[test]
+    fn test_output_style_provider_color() {
+        let style = OutputStyle {
+            color: true,
+            theme: Theme::Vivid,
+        };
+        assert_eq!(style.provider_color(Provider::Anthropic), Some(AnsiColor::Magenta));
+        assert_eq!(style.provider_color(Provider::OpenAI), Some(AnsiColor::BrightGreen));
+        assert_eq!(style.provider_color(Provider::Google), Some(AnsiColor::BrightBlue));
+        assert_eq!(style.provider_color(Provider::Unknown), Some(AnsiColor::BrightBlack));
+    }
+
+    #[test]
+    fn test_output_style_accent_color() {
+        let style_color = OutputStyle {
+            color: true,
+            theme: Theme::Vivid,
+        };
+        let style_no_color = OutputStyle {
+            color: false,
+            theme: Theme::Vivid,
+        };
+        assert_eq!(style_color.accent(), Some(AnsiColor::BrightCyan));
+        assert_eq!(style_no_color.accent(), None);
+    }
+
+    #[test]
+    fn test_stats_default() {
+        let stats = Stats::default();
+        assert_eq!(stats.connects, 0);
+        assert_eq!(stats.closes, 0);
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.peak_active, 0);
+        assert!(stats.per_provider.is_empty());
+        assert!(stats.per_domain.is_empty());
+        assert!(stats.per_port.is_empty());
+        assert!(stats.per_comm.is_empty());
+    }
+
+    #[test]
+    fn test_stats_aggregation_per_provider() {
+        let mut stats = Stats::default();
+
+        // Simulate aggregating provider stats
+        *stats.per_provider.entry(Provider::Anthropic).or_insert(0) += 1;
+        *stats.per_provider.entry(Provider::Anthropic).or_insert(0) += 1;
+        *stats.per_provider.entry(Provider::OpenAI).or_insert(0) += 1;
+
+        assert_eq!(stats.per_provider.get(&Provider::Anthropic), Some(&2));
+        assert_eq!(stats.per_provider.get(&Provider::OpenAI), Some(&1));
+        assert_eq!(stats.per_provider.get(&Provider::Google), None);
+    }
+
+    #[test]
+    fn test_stats_aggregation_per_domain() {
+        let mut stats = Stats::default();
+
+        *stats.per_domain.entry("api.anthropic.com".to_string()).or_insert(0) += 5;
+        *stats.per_domain.entry("api.openai.com".to_string()).or_insert(0) += 3;
+        *stats.per_domain.entry("api.anthropic.com".to_string()).or_insert(0) += 2;
+
+        assert_eq!(stats.per_domain.get("api.anthropic.com"), Some(&7));
+        assert_eq!(stats.per_domain.get("api.openai.com"), Some(&3));
+    }
+
+    #[test]
+    fn test_stats_aggregation_per_port() {
+        let mut stats = Stats::default();
+
+        *stats.per_port.entry(443).or_insert(0) += 10;
+        *stats.per_port.entry(80).or_insert(0) += 5;
+        *stats.per_port.entry(443).or_insert(0) += 3;
+
+        assert_eq!(stats.per_port.get(&443), Some(&13));
+        assert_eq!(stats.per_port.get(&80), Some(&5));
+    }
+
+    #[test]
+    fn test_stats_aggregation_per_comm() {
+        let mut stats = Stats::default();
+
+        *stats.per_comm.entry("claude-code".to_string()).or_insert(0) += 20;
+        *stats.per_comm.entry("codex".to_string()).or_insert(0) += 10;
+
+        let items = top_n_string(&stats.per_comm, 2);
+        assert_eq!(items[0], ("claude-code".to_string(), 20));
+        assert_eq!(items[1], ("codex".to_string(), 10));
+    }
+
+    #[test]
+    fn test_ansi_color_codes() {
+        assert_eq!(AnsiColor::Red.code(), "31");
+        assert_eq!(AnsiColor::Green.code(), "32");
+        assert_eq!(AnsiColor::BrightCyan.code(), "96");
+        assert_eq!(AnsiColor::BrightBlack.code(), "90");
+    }
 }
