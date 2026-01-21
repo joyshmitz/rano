@@ -417,6 +417,10 @@ struct MonitorArgs {
     no_banner: bool,
     theme: Theme,
     alert: AlertConfig,
+    /// Retry detection threshold (number of connections in window to trigger warning)
+    retry_threshold: usize,
+    /// Retry detection window in milliseconds
+    retry_window_ms: u64,
 }
 
 /// Configuration for the alert system.
@@ -631,6 +635,8 @@ impl Default for MonitorArgs {
             no_banner: false,
             theme: Theme::Vivid,
             alert: AlertConfig::default(),
+            retry_threshold: 3,
+            retry_window_ms: 60000,
         }
     }
 }
@@ -1924,6 +1930,18 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 args.alert.no_alerts = true;
                 i += 1;
             }
+            "--retry-threshold" => {
+                i += 1;
+                let value = require_value(argv, i, "--retry-threshold")?;
+                args.retry_threshold = parse_usize(value, "--retry-threshold")?;
+                i += 1;
+            }
+            "--retry-window-ms" => {
+                i += 1;
+                let value = require_value(argv, i, "--retry-window-ms")?;
+                args.retry_window_ms = parse_u64(value, "--retry-window-ms")?;
+                i += 1;
+            }
             "--preset" => {
                 // Already handled in find_preset_flags
                 i += 2;
@@ -2791,6 +2809,9 @@ ALERT OPTIONS:\n\
   --alert-bell                   Ring terminal bell on alerts\n\
   --alert-cooldown-ms <ms>       Suppress duplicate alerts within window (default: 10000)\n\
   --no-alerts                    Disable all alerting\n\n\
+RETRY DETECTION:\n\
+  --retry-threshold <n>          Connections in window to trigger warning (default: 3)\n\
+  --retry-window-ms <ms>         Retry detection window in ms (default: 60000)\n\n\
 CONFIG:\n\
   --preset <name>           Load named preset (repeatable, merged in order)\n\
   --list-presets            List available presets and exit\n\
