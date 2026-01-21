@@ -107,6 +107,109 @@ struct MonitorArgs {
     stats_cycle_ms: u64,
     no_banner: bool,
     theme: Theme,
+    alert: AlertConfig,
+}
+
+/// Configuration for the alert system.
+/// Enables active monitoring with thresholds and pattern matching.
+#[derive(Clone, Debug)]
+struct AlertConfig {
+    /// Glob patterns for domain matching (case-insensitive)
+    domain_patterns: Vec<String>,
+    /// Alert when total active connections exceed this
+    max_connections: Option<u64>,
+    /// Alert when any single provider exceeds this
+    max_per_provider: Option<u64>,
+    /// Alert on connections longer than this (milliseconds)
+    duration_threshold_ms: Option<u64>,
+    /// Alert on connections with unresolved domain
+    alert_unknown_domain: bool,
+    /// Ring terminal bell on alert
+    bell: bool,
+    /// Cooldown between duplicate alerts (milliseconds)
+    cooldown_ms: u64,
+    /// Disable all alerting
+    no_alerts: bool,
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            domain_patterns: Vec::new(),
+            max_connections: None,
+            max_per_provider: None,
+            duration_threshold_ms: None,
+            alert_unknown_domain: false,
+            bell: false,
+            cooldown_ms: 10_000,
+            no_alerts: false,
+        }
+    }
+}
+
+impl AlertConfig {
+    fn is_enabled(&self) -> bool {
+        if self.no_alerts {
+            return false;
+        }
+        !self.domain_patterns.is_empty()
+            || self.max_connections.is_some()
+            || self.max_per_provider.is_some()
+            || self.duration_threshold_ms.is_some()
+            || self.alert_unknown_domain
+    }
+}
+
+/// Types of alerts that can be triggered.
+#[derive(Clone, Debug)]
+enum AlertKind {
+    /// Domain matched a pattern
+    DomainMatch { domain: String, pattern: String },
+    /// Total connections exceeded threshold
+    MaxConnections { current: u64, threshold: u64 },
+    /// Provider connections exceeded threshold
+    MaxPerProvider { provider: Provider, current: u64, threshold: u64 },
+    /// Connection exceeded duration threshold
+    LongDuration { duration_ms: u64, threshold_ms: u64 },
+    /// Connection to unresolved domain
+    UnknownDomain { remote_ip: IpAddr },
+}
+
+/// Severity level for alerts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlertSeverity {
+    Warning,  // Yellow - approaching threshold, unknown domain
+    Critical, // Red - threshold exceeded, domain match
+}
+
+impl AlertSeverity {
+    fn label(self) -> &'static str {
+        match self {
+            AlertSeverity::Warning => "WARNING",
+            AlertSeverity::Critical => "CRITICAL",
+        }
+    }
+}
+
+/// Unique signature for deduplication (cooldown).
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+enum AlertSignature {
+    DomainMatch { domain: String, pattern: String },
+    MaxConnections,
+    MaxPerProvider { provider: Provider },
+    LongDuration { conn_key: ConnKey },
+    UnknownDomain { remote_ip: IpAddr },
+}
+
+/// State for tracking alert cooldowns and counts.
+#[derive(Debug)]
+struct AlertState {
+    /// Last alert time per alert signature
+    last_alert: HashMap<AlertSignature, SystemTime>,
+    /// Total alerts triggered this session
+    alert_count: u64,
+    /// Alerts suppressed due to cooldown
+    suppressed_count: u64,
 }
 
 impl Default for MonitorArgs {
@@ -142,6 +245,7 @@ impl Default for MonitorArgs {
             stats_cycle_ms: 0,
             no_banner: false,
             theme: Theme::Vivid,
+            alert: AlertConfig::default(),
         }
     }
 }
@@ -613,6 +717,11 @@ fn main() {
 
     let mut active: HashMap<ConnKey, ConnInfo> = HashMap::new();
     let mut stats = Stats::default();
+    let mut alert_state = AlertState {
+        last_alert: HashMap::new(),
+        alert_count: 0,
+        suppressed_count: 0,
+    };
 
     let resolved_log_format = log_format_for_output(args.json, args.log_format);
     let log_writer = open_log_writer(&args, &domain_label, resolved_log_format);
@@ -770,6 +879,27 @@ fn main() {
                 if let Some(name) = domain {
                     *stats.per_domain.entry(name).or_insert(0) += 1;
                 }
+
+                // Check connection-level alerts (domain pattern, unknown domain)
+                if let Some(conn_info) = active.get(&key) {
+                    check_connection_alerts(
+                        &args.alert,
+                        &mut alert_state,
+                        &key,
+                        conn_info,
+                        args.json,
+                        style,
+                    );
+                }
+
+                // Check threshold alerts (max connections, max per provider)
+                check_threshold_alerts(
+                    &args.alert,
+                    &mut alert_state,
+                    &stats,
+                    args.json,
+                    style,
+                );
             } else if let Some(info) = active.get_mut(&key) {
                 info.last_seen = now;
             }
@@ -826,6 +956,17 @@ fn main() {
                     stats.duration_ms_samples += 1;
                     stats.duration_ms_total = stats.duration_ms_total.saturating_add(ms);
                     stats.duration_ms_max = stats.duration_ms_max.max(ms);
+
+                    // Check duration alert
+                    check_duration_alert(
+                        &args.alert,
+                        &mut alert_state,
+                        &key,
+                        &info,
+                        ms,
+                        args.json,
+                        style,
+                    );
                 }
             }
         }
@@ -1123,6 +1264,60 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 i += 1;
                 let value = require_value(argv, i, "--theme")?;
                 args.theme = parse_theme(value)?;
+                i += 1;
+            }
+            "--alert-domain" => {
+                i += 1;
+                let value = require_value(argv, i, "--alert-domain")?;
+                args.alert.domain_patterns.push(value.to_string());
+                i += 1;
+            }
+            "--alert-max-connections" => {
+                i += 1;
+                let value = require_value(argv, i, "--alert-max-connections")?;
+                let n = parse_u64(value, "--alert-max-connections")?;
+                if n == 0 {
+                    return Err("--alert-max-connections must be >= 1".to_string());
+                }
+                args.alert.max_connections = Some(n);
+                i += 1;
+            }
+            "--alert-max-per-provider" => {
+                i += 1;
+                let value = require_value(argv, i, "--alert-max-per-provider")?;
+                let n = parse_u64(value, "--alert-max-per-provider")?;
+                if n == 0 {
+                    return Err("--alert-max-per-provider must be >= 1".to_string());
+                }
+                args.alert.max_per_provider = Some(n);
+                i += 1;
+            }
+            "--alert-duration-ms" => {
+                i += 1;
+                let value = require_value(argv, i, "--alert-duration-ms")?;
+                let n = parse_u64(value, "--alert-duration-ms")?;
+                if n == 0 {
+                    return Err("--alert-duration-ms must be >= 1".to_string());
+                }
+                args.alert.duration_threshold_ms = Some(n);
+                i += 1;
+            }
+            "--alert-unknown-domain" => {
+                args.alert.alert_unknown_domain = true;
+                i += 1;
+            }
+            "--alert-bell" => {
+                args.alert.bell = true;
+                i += 1;
+            }
+            "--alert-cooldown-ms" => {
+                i += 1;
+                let value = require_value(argv, i, "--alert-cooldown-ms")?;
+                args.alert.cooldown_ms = parse_u64(value, "--alert-cooldown-ms")?;
+                i += 1;
+            }
+            "--no-alerts" => {
+                args.alert.no_alerts = true;
                 i += 1;
             }
             "--config" => {
@@ -1507,6 +1702,32 @@ fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> 
             }
             "no_banner" => args.no_banner = parse_bool(value)?,
             "theme" => args.theme = parse_theme(value)?,
+            "alert_domain" => push_list_value(&mut args.alert.domain_patterns, value),
+            "alert_max_connections" => {
+                let n = parse_u64(value, "alert_max_connections")?;
+                if n == 0 {
+                    return Err("alert_max_connections must be >= 1".to_string());
+                }
+                args.alert.max_connections = Some(n);
+            }
+            "alert_max_per_provider" => {
+                let n = parse_u64(value, "alert_max_per_provider")?;
+                if n == 0 {
+                    return Err("alert_max_per_provider must be >= 1".to_string());
+                }
+                args.alert.max_per_provider = Some(n);
+            }
+            "alert_duration_ms" => {
+                let n = parse_u64(value, "alert_duration_ms")?;
+                if n == 0 {
+                    return Err("alert_duration_ms must be >= 1".to_string());
+                }
+                args.alert.duration_threshold_ms = Some(n);
+            }
+            "alert_unknown_domain" => args.alert.alert_unknown_domain = parse_bool(value)?,
+            "alert_bell" => args.alert.bell = parse_bool(value)?,
+            "alert_cooldown_ms" => args.alert.cooldown_ms = parse_u64(value, "alert_cooldown_ms")?,
+            "no_alerts" => args.alert.no_alerts = parse_bool(value)?,
             _ => {
                 eprintln!(
                     "warning: unknown config key '{}' in {}", key, path.display()
@@ -1740,7 +1961,59 @@ fn parse_provider_mode(value: &str) -> Result<ProviderMode, String> {
 
 fn print_help() {
     println!(
-        "rano - AI CLI network observer\n\nUSAGE:\n  rano [options]\n  rano report [options]\n  rano update [options]\n\nCOMMANDS:\n  report    Query SQLite event history (use --help for details)\n  update    Update the rano binary\n\nOPTIONS:\n  --pattern <str>           Process name or cmdline substring to match (repeatable)\n  --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n  --pid <pid>               Monitor a specific PID (repeatable)\n  --no-descendants          Do not include descendant processes\n  --interval-ms <ms>        Poll interval (default: 1000)\n  --json                    Emit JSON lines to stdout\n  --summary-only            Suppress live events, show summary only\n  --domain-mode <mode>      auto|ptr|pcap (default: auto)\n  --pcap                    Force pcap mode (falls back with warning)\n  --no-dns                  Disable PTR lookups\n  --include-udp             Include UDP sockets (default: true)\n  --no-udp                  Disable UDP sockets\n  --include-listening       Include listening TCP sockets\n  --log-file <path>         Append output to log file\n  --log-dir <path>          Write per-run log files into directory\n  --log-format <fmt>        auto|pretty|json for log files (default: auto)\n  --once                    Emit a single poll and exit\n  --color <mode>            auto|always|never (default: auto)\n  --no-color                Disable ANSI color\n  --theme <name>            vivid|mono (default: vivid)\n  --sqlite <path>           SQLite file for persistent logging\n  --no-sqlite               Disable SQLite logging\n  --db-batch-size <n>       SQLite batch size (events per transaction)\n  --db-flush-ms <ms>        SQLite flush interval in ms\n  --db-queue-max <n>        SQLite queue capacity (events)\n  --stats-interval-ms <ms>  Live stats interval (0 disables)\n  --stats-width <n>         ASCII bar width\n  --stats-top <n>           Top-N domains/IPs in stats/summary\n  --stats-view <name>       Stats view: provider|domain|port|process (repeatable)\n  --stats-cycle-ms <ms>     Rotate stats views at this interval (0 disables)\n  --no-banner               Suppress startup banner\n  --config <path>           Load config file (key=value format)\n  --config-toml <path>      Load provider config (TOML)\n  --no-config               Ignore config files\n  -h, --help                Show this help\n  -V, --version             Show version\n"
+        "rano - AI CLI network observer\n\n\
+USAGE:\n  rano [options]\n  rano report [options]\n  rano update [options]\n\n\
+COMMANDS:\n  report    Query SQLite event history (use --help for details)\n  update    Update the rano binary\n\n\
+OPTIONS:\n\
+  --pattern <str>           Process name or cmdline substring to match (repeatable)\n\
+  --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n\
+  --pid <pid>               Monitor a specific PID (repeatable)\n\
+  --no-descendants          Do not include descendant processes\n\
+  --interval-ms <ms>        Poll interval (default: 1000)\n\
+  --json                    Emit JSON lines to stdout\n\
+  --summary-only            Suppress live events, show summary only\n\
+  --domain-mode <mode>      auto|ptr|pcap (default: auto)\n\
+  --pcap                    Force pcap mode (falls back with warning)\n\
+  --no-dns                  Disable PTR lookups\n\
+  --include-udp             Include UDP sockets (default: true)\n\
+  --no-udp                  Disable UDP sockets\n\
+  --include-listening       Include listening TCP sockets\n\
+  --log-file <path>         Append output to log file\n\
+  --log-dir <path>          Write per-run log files into directory\n\
+  --log-format <fmt>        auto|pretty|json for log files (default: auto)\n\
+  --once                    Emit a single poll and exit\n\
+  --color <mode>            auto|always|never (default: auto)\n\
+  --no-color                Disable ANSI color\n\
+  --theme <name>            vivid|mono (default: vivid)\n\
+  --sqlite <path>           SQLite file for persistent logging\n\
+  --no-sqlite               Disable SQLite logging\n\
+  --db-batch-size <n>       SQLite batch size (events per transaction)\n\
+  --db-flush-ms <ms>        SQLite flush interval in ms\n\
+  --db-queue-max <n>        SQLite queue capacity (events)\n\
+  --stats-interval-ms <ms>  Live stats interval (0 disables)\n\
+  --stats-width <n>         ASCII bar width\n\
+  --stats-top <n>           Top-N domains/IPs in stats/summary\n\
+  --stats-view <name>       Stats view: provider|domain|port|process (repeatable)\n\
+  --stats-cycle-ms <ms>     Rotate stats views at this interval (0 disables)\n\
+  --no-banner               Suppress startup banner\n\n\
+ALERT OPTIONS:\n\
+  --alert-domain <pattern>       Alert on domains matching glob pattern (repeatable)\n\
+  --alert-max-connections <n>    Alert when total active connections exceed N\n\
+  --alert-max-per-provider <n>   Alert when any provider exceeds N connections\n\
+  --alert-duration-ms <ms>       Alert on connections lasting longer than N ms\n\
+  --alert-unknown-domain         Alert on connections to unresolved domains\n\
+  --alert-bell                   Ring terminal bell on alerts\n\
+  --alert-cooldown-ms <ms>       Suppress duplicate alerts within window (default: 10000)\n\
+  --no-alerts                    Disable all alerting\n\n\
+CONFIG:\n\
+  --config <path>           Load config file (key=value format)\n\
+  --config-toml <path>      Load provider config (TOML)\n\
+  --no-config               Ignore config files\n\
+  -h, --help                Show this help\n\
+  -V, --version             Show version\n\n\
+EXAMPLES:\n\
+  rano --alert-domain '*.evil.com' --alert-max-connections 100\n\
+  rano --pattern claude --alert-unknown-domain\n"
     );
 }
 
@@ -1976,6 +2249,315 @@ fn log_format_for_output(json_mode: bool, log_format: LogFormat) -> LogFormat {
         other => other,
     }
 }
+
+// --- Alert System Functions ---
+
+/// Check if an alert should be emitted (respecting cooldown).
+fn should_emit_alert(
+    state: &mut AlertState,
+    sig: &AlertSignature,
+    cooldown_ms: u64,
+) -> bool {
+    let now = SystemTime::now();
+    if let Some(last) = state.last_alert.get(sig) {
+        if let Ok(elapsed) = now.duration_since(*last) {
+            if elapsed.as_millis() < cooldown_ms as u128 {
+                state.suppressed_count += 1;
+                return false;
+            }
+        }
+    }
+    state.last_alert.insert(sig.clone(), now);
+    state.alert_count += 1;
+    true
+}
+
+/// Simple glob pattern match (supports * and ?).
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.to_lowercase();
+    let text = text.to_lowercase();
+    glob_match_impl(pattern.as_bytes(), text.as_bytes())
+}
+
+fn glob_match_impl(pattern: &[u8], text: &[u8]) -> bool {
+    let mut p_idx = 0;
+    let mut t_idx = 0;
+    let mut star_p_idx: Option<usize> = None;
+    let mut star_t_idx: usize = 0;
+
+    while t_idx < text.len() {
+        if p_idx < pattern.len() && (pattern[p_idx] == b'?' || pattern[p_idx] == text[t_idx]) {
+            p_idx += 1;
+            t_idx += 1;
+        } else if p_idx < pattern.len() && pattern[p_idx] == b'*' {
+            star_p_idx = Some(p_idx);
+            star_t_idx = t_idx;
+            p_idx += 1;
+        } else if let Some(sp) = star_p_idx {
+            p_idx = sp + 1;
+            star_t_idx += 1;
+            t_idx = star_t_idx;
+        } else {
+            return false;
+        }
+    }
+
+    while p_idx < pattern.len() && pattern[p_idx] == b'*' {
+        p_idx += 1;
+    }
+    p_idx == pattern.len()
+}
+
+/// Check domain against alert patterns.
+fn check_domain_patterns(domain: Option<&str>, patterns: &[String]) -> Option<String> {
+    let domain = domain?;
+    for pattern in patterns {
+        if glob_match(pattern, domain) {
+            return Some(pattern.clone());
+        }
+    }
+    None
+}
+
+/// Emit an alert to stderr (and optionally ring bell).
+fn emit_alert(
+    kind: &AlertKind,
+    severity: AlertSeverity,
+    conn_key: Option<&ConnKey>,
+    conn_info: Option<&ConnInfo>,
+    bell: bool,
+    json_mode: bool,
+    style: OutputStyle,
+) {
+    let ts = now_rfc3339();
+
+    if json_mode {
+        let json = format_json_alert(&ts, kind, severity, conn_key, conn_info);
+        println!("{}", json);
+    } else {
+        let line = format_pretty_alert(&ts, kind, severity, conn_key, conn_info, style);
+        eprintln!("{}", line);
+    }
+
+    if bell {
+        eprint!("\x07"); // Bell character
+    }
+}
+
+fn format_json_alert(
+    ts: &str,
+    kind: &AlertKind,
+    severity: AlertSeverity,
+    conn_key: Option<&ConnKey>,
+    conn_info: Option<&ConnInfo>,
+) -> String {
+    let mut parts = vec![
+        format!("\"ts\":\"{}\"", ts),
+        "\"type\":\"alert\"".to_string(),
+    ];
+
+    let (kind_str, extra) = match kind {
+        AlertKind::DomainMatch { domain, pattern } => {
+            ("domain_match", format!(",\"pattern\":\"{}\",\"domain\":\"{}\"", pattern, domain))
+        }
+        AlertKind::MaxConnections { current, threshold } => {
+            ("max_connections", format!(",\"threshold\":{},\"actual\":{}", threshold, current))
+        }
+        AlertKind::MaxPerProvider { provider, current, threshold } => {
+            ("max_per_provider", format!(",\"provider\":\"{}\",\"threshold\":{},\"actual\":{}", provider.label(), threshold, current))
+        }
+        AlertKind::LongDuration { duration_ms, threshold_ms } => {
+            ("long_duration", format!(",\"duration_ms\":{},\"threshold_ms\":{}", duration_ms, threshold_ms))
+        }
+        AlertKind::UnknownDomain { remote_ip } => {
+            ("unknown_domain", format!(",\"remote_ip\":\"{}\"", remote_ip))
+        }
+    };
+
+    parts.push(format!("\"kind\":\"{}\"", kind_str));
+    parts.push(format!("\"severity\":\"{}\"", severity.label().to_lowercase()));
+
+    if let Some(key) = conn_key {
+        let proto = match key.proto {
+            Proto::Tcp => "tcp",
+            Proto::Udp => "udp",
+        };
+        parts.push(format!("\"proto\":\"{}\"", proto));
+        parts.push(format!("\"local\":\"{}:{}\"", key.local_ip, key.local_port));
+        parts.push(format!("\"remote\":\"{}:{}\"", key.remote_ip, key.remote_port));
+    }
+
+    if let Some(info) = conn_info {
+        parts.push(format!("\"pid\":{}", info.pid));
+        parts.push(format!("\"comm\":\"{}\"", info.comm));
+    }
+
+    format!("{{{}{}}}", parts.join(","), extra)
+}
+
+fn format_pretty_alert(
+    ts: &str,
+    kind: &AlertKind,
+    severity: AlertSeverity,
+    conn_key: Option<&ConnKey>,
+    conn_info: Option<&ConnInfo>,
+    style: OutputStyle,
+) -> String {
+    let alert_prefix = if style.color {
+        "\x1b[31m[ALERT]\x1b[0m"
+    } else {
+        "[ALERT]"
+    };
+
+    let severity_str = match (severity, style.color) {
+        (AlertSeverity::Critical, true) => "\x1b[1;31mCRITICAL\x1b[0m",
+        (AlertSeverity::Warning, true) => "\x1b[1;33mWARNING\x1b[0m",
+        (_, false) => severity.label(),
+    };
+
+    let kind_str = match kind {
+        AlertKind::DomainMatch { domain, pattern } => {
+            format!("domain_match | {} matched {}", domain, pattern)
+        }
+        AlertKind::MaxConnections { current, threshold } => {
+            format!("max_connections | {}/{} active connections", current, threshold)
+        }
+        AlertKind::MaxPerProvider { provider, current, threshold } => {
+            format!("max_per_provider | {}: {}/{} connections", provider.label(), current, threshold)
+        }
+        AlertKind::LongDuration { duration_ms, threshold_ms } => {
+            format!("long_duration | {}ms > {}ms", duration_ms, threshold_ms)
+        }
+        AlertKind::UnknownDomain { remote_ip } => {
+            format!("unknown_domain | unresolved: {}", remote_ip)
+        }
+    };
+
+    let conn_str = if let (Some(key), Some(info)) = (conn_key, conn_info) {
+        let proto = match key.proto {
+            Proto::Tcp => "tcp",
+            Proto::Udp => "udp",
+        };
+        format!(" | pid={} | {} | {} | {}:{} -> {}:{}",
+            info.pid, info.comm, proto, key.local_ip, key.local_port, key.remote_ip, key.remote_port)
+    } else {
+        String::new()
+    };
+
+    format!("{} {} | {} | {}{}", alert_prefix, ts, severity_str, kind_str, conn_str)
+}
+
+/// Check connection-level alerts (domain pattern, unknown domain).
+fn check_connection_alerts(
+    alert_config: &AlertConfig,
+    alert_state: &mut AlertState,
+    key: &ConnKey,
+    info: &ConnInfo,
+    json_mode: bool,
+    style: OutputStyle,
+) {
+    if !alert_config.is_enabled() {
+        return;
+    }
+
+    // Check domain patterns
+    if let Some(pattern) = check_domain_patterns(info.domain.as_deref(), &alert_config.domain_patterns) {
+        let sig = AlertSignature::DomainMatch {
+            domain: info.domain.clone().unwrap_or_default(),
+            pattern: pattern.clone(),
+        };
+        if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
+            let kind = AlertKind::DomainMatch {
+                domain: info.domain.clone().unwrap_or_default(),
+                pattern,
+            };
+            emit_alert(&kind, AlertSeverity::Critical, Some(key), Some(info), alert_config.bell, json_mode, style);
+        }
+    }
+
+    // Check unknown domain
+    if alert_config.alert_unknown_domain && info.domain.is_none() {
+        let sig = AlertSignature::UnknownDomain { remote_ip: key.remote_ip };
+        if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
+            let kind = AlertKind::UnknownDomain { remote_ip: key.remote_ip };
+            emit_alert(&kind, AlertSeverity::Warning, Some(key), Some(info), alert_config.bell, json_mode, style);
+        }
+    }
+}
+
+/// Check threshold-level alerts (max connections, max per provider).
+fn check_threshold_alerts(
+    alert_config: &AlertConfig,
+    alert_state: &mut AlertState,
+    stats: &Stats,
+    json_mode: bool,
+    style: OutputStyle,
+) {
+    if !alert_config.is_enabled() {
+        return;
+    }
+
+    // Check max connections threshold
+    if let Some(threshold) = alert_config.max_connections {
+        if stats.active >= threshold {
+            let sig = AlertSignature::MaxConnections;
+            if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
+                let kind = AlertKind::MaxConnections {
+                    current: stats.active,
+                    threshold,
+                };
+                emit_alert(&kind, AlertSeverity::Warning, None, None, alert_config.bell, json_mode, style);
+            }
+        }
+    }
+
+    // Check max per provider threshold
+    if let Some(threshold) = alert_config.max_per_provider {
+        for (provider, count) in &stats.per_provider {
+            if *count >= threshold {
+                let sig = AlertSignature::MaxPerProvider { provider: *provider };
+                if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
+                    let kind = AlertKind::MaxPerProvider {
+                        provider: *provider,
+                        current: *count,
+                        threshold,
+                    };
+                    emit_alert(&kind, AlertSeverity::Warning, None, None, alert_config.bell, json_mode, style);
+                }
+            }
+        }
+    }
+}
+
+/// Check duration alerts on connection close.
+fn check_duration_alert(
+    alert_config: &AlertConfig,
+    alert_state: &mut AlertState,
+    key: &ConnKey,
+    info: &ConnInfo,
+    duration_ms: u64,
+    json_mode: bool,
+    style: OutputStyle,
+) {
+    if !alert_config.is_enabled() {
+        return;
+    }
+
+    if let Some(threshold_ms) = alert_config.duration_threshold_ms {
+        if duration_ms > threshold_ms {
+            let sig = AlertSignature::LongDuration { conn_key: key.clone() };
+            if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
+                let kind = AlertKind::LongDuration {
+                    duration_ms,
+                    threshold_ms,
+                };
+                emit_alert(&kind, AlertSeverity::Warning, Some(key), Some(info), alert_config.bell, json_mode, style);
+            }
+        }
+    }
+}
+
+// --- End Alert System Functions ---
 
 fn emit_event(
     ts: &str,
