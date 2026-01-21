@@ -381,6 +381,107 @@ rano --alert-domain "*.cn" \
 
 ---
 
+## Exporting Data
+
+rano can export SQLite event history to CSV or JSONL for use with external tools like Excel, Pandas, jq, or data pipelines.
+
+### Quick Examples
+
+```bash
+# Export all events to CSV (Excel-compatible)
+rano export --format csv > connections.csv
+
+# Export to JSONL for shell pipelines
+rano export --format jsonl | jq '.domain' | sort | uniq -c
+
+# Filter by time range
+rano export --format csv --since 24h > daily.csv
+rano export --format csv --since 2026-01-20 --until 2026-01-21 > jan20.csv
+
+# Filter by provider
+rano export --format csv --provider anthropic > anthropic.csv
+
+# Filter by domain pattern
+rano export --format csv --domain "*.openai.com" > openai.csv
+
+# Custom SQLite file
+rano export --format csv --sqlite /path/to/observer.sqlite > export.csv
+```
+
+### Export Flags
+
+| Flag | Description |
+|------|-------------|
+| `--format csv\|jsonl` | Output format (required) |
+| `--sqlite <path>` | SQLite database (default: observer.sqlite) |
+| `--since <timestamp>` | Events after timestamp (RFC3339, date, or relative like `24h`) |
+| `--until <timestamp>` | Events before timestamp |
+| `--run-id <id>` | Filter by session run ID |
+| `--provider <name>` | Filter by provider (anthropic, openai, google, unknown) |
+| `--domain <pattern>` | Filter by domain glob pattern (repeatable) |
+| `--fields <list>` | Override default field list (comma-separated) |
+| `--no-header` | Omit CSV header row |
+
+### Output Fields
+
+Both CSV and JSONL include these fields (in order for CSV):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ts` | string | ISO 8601 timestamp |
+| `run_id` | string | Session identifier |
+| `event` | string | `connect` or `close` |
+| `provider` | string | anthropic, openai, google, unknown |
+| `pid` | integer | Process ID |
+| `comm` | string | Process command name |
+| `cmdline` | string | Full command line |
+| `proto` | string | `tcp` or `udp` |
+| `local_ip` | string | Local IP address |
+| `local_port` | integer | Local port |
+| `remote_ip` | string | Remote IP address |
+| `remote_port` | integer | Remote port |
+| `domain` | string | Resolved domain name (if available) |
+| `duration_ms` | integer | Connection duration in ms (close events only) |
+
+### Format Notes
+
+**CSV**
+- RFC 4180 compliant with CRLF line endings
+- Fields with commas, quotes, or newlines are properly escaped
+- UTF-8 encoded, compatible with Excel
+
+**JSONL**
+- One JSON object per line
+- LF line endings
+- Null fields are omitted
+- UTF-8 encoded, ideal for `jq` pipelines
+
+### Use Cases
+
+**Daily summary to spreadsheet**
+```bash
+rano export --format csv --since 24h > "$(date +%Y-%m-%d)-connections.csv"
+```
+
+**Find unique domains by provider**
+```bash
+rano export --format jsonl --provider anthropic | jq -r '.domain // empty' | sort -u
+```
+
+**Count connections per domain**
+```bash
+rano export --format jsonl | jq -r '.domain // "unknown"' | sort | uniq -c | sort -rn | head -20
+```
+
+**Import to Pandas**
+```python
+import pandas as pd
+df = pd.read_csv("connections.csv")
+df.groupby("provider")["event"].count()
+```
+
+---
+
 ## Configuration
 
 Default path: `~/.config/rano/config.conf`

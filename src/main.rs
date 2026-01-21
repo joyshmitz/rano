@@ -4600,7 +4600,7 @@ fn build_export_query(filter: &ExportFilter, fields: &[String]) -> (String, Vec<
         let conditions: Vec<String> = filter
             .domain_patterns
             .iter()
-            .map(|_| "LOWER(domain) LIKE ? ESCAPE '\\\\'".to_string())
+            .map(|_| "LOWER(domain) LIKE ? ESCAPE '\\'".to_string())
             .collect();
         sql.push_str(&format!(" AND ({})", conditions.join(" OR ")));
         for pattern in &filter.domain_patterns {
@@ -6569,5 +6569,193 @@ mod tests {
             .query_row("SELECT domain FROM events WHERE alert = 1", [], |row| row.get(0))
             .expect("domain query failed");
         assert_eq!(alert_domain, "evil.malicious.com");
+    }
+
+    // Export functionality unit tests (bd-uj6)
+
+    #[test]
+    fn csv_escape_handles_quotes() {
+        // Quotes must be doubled (RFC 4180)
+        assert_eq!(csv_escape("say \"hello\""), "\"say \"\"hello\"\"\"");
+        assert_eq!(csv_escape("\"quoted\""), "\"\"\"quoted\"\"\"");
+        assert_eq!(csv_escape("a\"b\"c"), "\"a\"\"b\"\"c\"");
+    }
+
+    #[test]
+    fn csv_escape_handles_commas() {
+        assert_eq!(csv_escape("a,b,c"), "\"a,b,c\"");
+        assert_eq!(csv_escape("foo, bar"), "\"foo, bar\"");
+        assert_eq!(csv_escape(",leading"), "\",leading\"");
+        assert_eq!(csv_escape("trailing,"), "\"trailing,\"");
+    }
+
+    #[test]
+    fn csv_escape_handles_newlines() {
+        assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
+        assert_eq!(csv_escape("line1\r\nline2"), "\"line1\r\nline2\"");
+        assert_eq!(csv_escape("has\rcarriage"), "\"has\rcarriage\"");
+    }
+
+    #[test]
+    fn csv_escape_combined_special_chars() {
+        // Combined: commas, quotes, and newlines
+        assert_eq!(csv_escape("a,\"b\"\nc"), "\"a,\"\"b\"\"\nc\"");
+    }
+
+    #[test]
+    fn csv_header_has_correct_field_order() {
+        let fields = vec![
+            "ts".to_string(),
+            "run_id".to_string(),
+            "event".to_string(),
+            "provider".to_string(),
+        ];
+        let header = format_csv_header(&fields);
+        assert_eq!(header, "ts,run_id,event,provider\r\n");
+    }
+
+    #[test]
+    fn csv_row_formats_correctly() {
+        let values: Vec<(String, FieldValue)> = vec![
+            ("ts".to_string(), FieldValue::String("2026-01-21T12:00:00Z".to_string())),
+            ("pid".to_string(), FieldValue::Integer(1234)),
+            ("domain".to_string(), FieldValue::Null),
+        ];
+        let row = format_csv_row(&values);
+        assert_eq!(row, "2026-01-21T12:00:00Z,1234,\r\n");
+    }
+
+    #[test]
+    fn jsonl_row_is_valid_json() {
+        let values: Vec<(String, FieldValue)> = vec![
+            ("ts".to_string(), FieldValue::String("2026-01-21T12:00:00Z".to_string())),
+            ("pid".to_string(), FieldValue::Integer(1234)),
+            ("comm".to_string(), FieldValue::String("test".to_string())),
+        ];
+        let row = format_jsonl_row(&values);
+        // Should be valid JSON ending with newline
+        assert!(row.ends_with('\n'));
+        // Remove trailing newline and parse
+        let json_str = row.trim_end();
+        // Verify it starts with { and ends with }
+        assert!(json_str.starts_with('{'));
+        assert!(json_str.ends_with('}'));
+        // Verify expected fields are present
+        assert!(json_str.contains("\"ts\":\"2026-01-21T12:00:00Z\""));
+        assert!(json_str.contains("\"pid\":1234"));
+    }
+
+    #[test]
+    fn jsonl_row_omits_null_values() {
+        let values: Vec<(String, FieldValue)> = vec![
+            ("ts".to_string(), FieldValue::String("2026-01-21T12:00:00Z".to_string())),
+            ("domain".to_string(), FieldValue::Null),
+            ("pid".to_string(), FieldValue::Integer(42)),
+        ];
+        let row = format_jsonl_row(&values);
+        // domain should not appear since it's null
+        assert!(!row.contains("domain"));
+        assert!(row.contains("ts"));
+        assert!(row.contains("pid"));
+    }
+
+    #[test]
+    fn jsonl_row_escapes_special_json_chars() {
+        let values: Vec<(String, FieldValue)> = vec![
+            ("comm".to_string(), FieldValue::String("test\nwith\ttabs".to_string())),
+        ];
+        let row = format_jsonl_row(&values);
+        // Newlines and tabs must be escaped in JSON
+        assert!(row.contains("\\n") || row.contains("\\t") || !row.contains('\t'));
+    }
+
+    #[test]
+    fn export_query_builds_with_no_filters() {
+        let filter = ExportFilter {
+            run_id: None,
+            since: None,
+            until: None,
+            providers: vec![],
+            domain_patterns: vec![],
+        };
+        let fields = vec!["ts".to_string(), "event".to_string()];
+        let (sql, params) = build_export_query(&filter, &fields);
+        assert!(sql.contains("SELECT ts, event FROM events"));
+        assert!(sql.contains("WHERE 1=1"));
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn export_query_builds_with_run_id_filter() {
+        let filter = ExportFilter {
+            run_id: Some("run-123".to_string()),
+            since: None,
+            until: None,
+            providers: vec![],
+            domain_patterns: vec![],
+        };
+        let fields = vec!["ts".to_string()];
+        let (sql, params) = build_export_query(&filter, &fields);
+        assert!(sql.contains("run_id = ?"));
+        assert_eq!(params, vec!["run-123"]);
+    }
+
+    #[test]
+    fn export_query_builds_with_time_filters() {
+        let filter = ExportFilter {
+            run_id: None,
+            since: Some("2026-01-20T00:00:00Z".to_string()),
+            until: Some("2026-01-21T00:00:00Z".to_string()),
+            providers: vec![],
+            domain_patterns: vec![],
+        };
+        let fields = vec!["ts".to_string()];
+        let (sql, params) = build_export_query(&filter, &fields);
+        assert!(sql.contains("ts >= ?"));
+        assert!(sql.contains("ts < ?"));
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn export_query_builds_with_provider_filter() {
+        let filter = ExportFilter {
+            run_id: None,
+            since: None,
+            until: None,
+            providers: vec!["anthropic".to_string(), "openai".to_string()],
+            domain_patterns: vec![],
+        };
+        let fields = vec!["ts".to_string()];
+        let (sql, params) = build_export_query(&filter, &fields);
+        assert!(sql.contains("LOWER(provider) IN (?,?)"));
+        assert!(params.contains(&"anthropic".to_string()));
+        assert!(params.contains(&"openai".to_string()));
+    }
+
+    #[test]
+    fn export_query_builds_with_domain_filter() {
+        let filter = ExportFilter {
+            run_id: None,
+            since: None,
+            until: None,
+            providers: vec![],
+            domain_patterns: vec!["*.example.com".to_string()],
+        };
+        let fields = vec!["ts".to_string()];
+        let (sql, params) = build_export_query(&filter, &fields);
+        assert!(sql.contains("LOWER(domain) LIKE ? ESCAPE"));
+        assert!(params.contains(&"%.example.com".to_string()));
+    }
+
+    #[test]
+    fn validate_fields_accepts_valid_fields() {
+        let fields = vec!["ts".to_string(), "event".to_string(), "provider".to_string(), "domain".to_string()];
+        assert!(validate_fields(&fields).is_ok());
+    }
+
+    #[test]
+    fn validate_fields_rejects_invalid_field() {
+        let fields = vec!["ts".to_string(), "invalid_field".to_string()];
+        assert!(validate_fields(&fields).is_err());
     }
 }
