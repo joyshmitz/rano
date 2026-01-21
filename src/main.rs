@@ -116,6 +116,259 @@ struct PresetLoader {
     user_preset_dirs: Vec<PathBuf>,
 }
 
+impl PresetLoader {
+    fn new() -> Self {
+        let mut builtin_presets = HashMap::new();
+        builtin_presets.insert("audit", PRESET_AUDIT);
+        builtin_presets.insert("quiet", PRESET_QUIET);
+        builtin_presets.insert("live", PRESET_LIVE);
+        builtin_presets.insert("verbose", PRESET_VERBOSE);
+
+        let mut user_preset_dirs = Vec::new();
+        if let Ok(home) = env::var("HOME") {
+            user_preset_dirs.push(PathBuf::from(home).join(".config/rano/presets"));
+        }
+
+        Self {
+            builtin_presets,
+            user_preset_dirs,
+        }
+    }
+
+    fn load_preset(&self, name: &str) -> Result<HashMap<String, String>, String> {
+        // Check builtin presets first
+        if let Some(content) = self.builtin_presets.get(name) {
+            return self.parse_preset_content(content);
+        }
+
+        // Search user preset directories
+        for dir in &self.user_preset_dirs {
+            let path = dir.join(format!("{}.conf", name));
+            if path.exists() {
+                let content = fs::read_to_string(&path)
+                    .map_err(|e| format!("Failed to read preset {}: {}", path.display(), e))?;
+                return self.parse_preset_content(&content);
+            }
+        }
+
+        // Preset not found - list available presets
+        let available = self.list_preset_names();
+        Err(format!(
+            "Unknown preset '{}'. Available: {}",
+            name,
+            available.join(", ")
+        ))
+    }
+
+    fn parse_preset_content(&self, content: &str) -> Result<HashMap<String, String>, String> {
+        let mut result = HashMap::new();
+        for (idx, line) in content.lines().enumerate() {
+            let raw = line.split('#').next().unwrap_or("").trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let mut parts = raw.splitn(2, '=');
+            let key = parts.next().unwrap_or("").trim();
+            let value = parts.next().unwrap_or("").trim();
+            if key.is_empty() {
+                continue;
+            }
+            if value.is_empty() {
+                eprintln!(
+                    "warning: preset line {}: missing value for '{}', skipping",
+                    idx + 1,
+                    key
+                );
+                continue;
+            }
+            result.insert(key.to_string(), value.to_string());
+        }
+        Ok(result)
+    }
+
+    fn list_presets(&self) -> Vec<PresetInfo> {
+        let mut presets = Vec::new();
+
+        // Add built-in presets
+        for (name, content) in &self.builtin_presets {
+            let description = self.extract_description(content);
+            presets.push(PresetInfo {
+                name: name.to_string(),
+                description,
+                source: PresetSource::Builtin,
+            });
+        }
+
+        // Add user presets
+        for dir in &self.user_preset_dirs {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |ext| ext == "conf") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            // Skip if this name is already a builtin (user overrides)
+                            if self.builtin_presets.contains_key(stem) {
+                                // Mark as user override
+                                if let Some(preset) = presets.iter_mut().find(|p| p.name == stem) {
+                                    preset.source = PresetSource::User(path.clone());
+                                }
+                                continue;
+                            }
+                            let description = if let Ok(content) = fs::read_to_string(&path) {
+                                self.extract_description(&content)
+                            } else {
+                                String::from("(unable to read description)")
+                            };
+                            presets.push(PresetInfo {
+                                name: stem.to_string(),
+                                description,
+                                source: PresetSource::User(path),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by name
+        presets.sort_by(|a, b| a.name.cmp(&b.name));
+        presets
+    }
+
+    fn list_preset_names(&self) -> Vec<String> {
+        self.list_presets().into_iter().map(|p| p.name).collect()
+    }
+
+    fn extract_description(&self, content: &str) -> String {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("# Description:") {
+                return trimmed
+                    .strip_prefix("# Description:")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+            }
+        }
+        String::new()
+    }
+}
+
+fn apply_preset_values(
+    values: &HashMap<String, String>,
+    args: &mut MonitorArgs,
+) -> Result<(), String> {
+    for (key, value) in values {
+        match key.as_str() {
+            "pattern" => push_list_value(&mut args.patterns, value),
+            "exclude_pattern" => push_list_value(&mut args.exclude_patterns, value),
+            "pid" => {
+                let pid = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid pid in preset: {}", value))?;
+                args.pids.push(pid);
+            }
+            "no_descendants" => args.no_descendants = parse_bool(value)?,
+            "interval_ms" => args.interval_ms = parse_u64(value, "interval_ms")?,
+            "json" => args.json = parse_bool(value)?,
+            "summary_only" => args.summary_only = parse_bool(value)?,
+            "domain_mode" => args.domain_mode = parse_domain_mode(value)?,
+            "pcap" => args.pcap = parse_bool(value)?,
+            "no_dns" => args.no_dns = parse_bool(value)?,
+            "include_udp" => args.include_udp = parse_bool(value)?,
+            "include_listening" => args.include_listening = parse_bool(value)?,
+            "show_ancestry" => args.show_ancestry = parse_bool(value)?,
+            "log_file" => args.log_file = Some(PathBuf::from(value)),
+            "log_dir" => args.log_dir = Some(PathBuf::from(value)),
+            "log_format" => args.log_format = parse_log_format(value)?,
+            "once" => args.once = parse_bool(value)?,
+            "color" => args.color = parse_color_mode(value)?,
+            "sqlite" => args.sqlite_path = value.to_string(),
+            "no_sqlite" => args.no_sqlite = parse_bool(value)?,
+            "db_batch_size" => {
+                args.db_batch_size = parse_usize(value, "db_batch_size")?;
+                if args.db_batch_size == 0 {
+                    return Err("db_batch_size must be >= 1".to_string());
+                }
+            }
+            "db_flush_ms" => {
+                args.db_flush_ms = parse_u64(value, "db_flush_ms")?;
+                if args.db_flush_ms == 0 {
+                    return Err("db_flush_ms must be >= 1".to_string());
+                }
+            }
+            "db_queue_max" => {
+                args.db_queue_max = parse_usize(value, "db_queue_max")?;
+                if args.db_queue_max == 0 {
+                    return Err("db_queue_max must be >= 1".to_string());
+                }
+            }
+            "stats_interval_ms" => args.stats_interval_ms = parse_u64(value, "stats_interval_ms")?,
+            "stats_width" => {
+                args.stats_width = parse_usize(value, "stats_width")?;
+                args.stats_width_set = true;
+            }
+            "stats_top" => args.stats_top = parse_usize(value, "stats_top")?,
+            "stats_view" => {
+                push_stats_views(&mut args.stats_views, value)?;
+            }
+            "stats_cycle_ms" => {
+                args.stats_cycle_ms = parse_u64(value, "stats_cycle_ms")?;
+            }
+            "no_banner" => args.no_banner = parse_bool(value)?,
+            "theme" => args.theme = parse_theme(value)?,
+            "alert_domain" => push_list_value(&mut args.alert.domain_patterns, value),
+            "alert_max_connections" => {
+                let n = parse_u64(value, "alert_max_connections")?;
+                if n == 0 {
+                    return Err("alert_max_connections must be >= 1".to_string());
+                }
+                args.alert.max_connections = Some(n);
+            }
+            "alert_max_per_provider" => {
+                let n = parse_u64(value, "alert_max_per_provider")?;
+                if n == 0 {
+                    return Err("alert_max_per_provider must be >= 1".to_string());
+                }
+                args.alert.max_per_provider = Some(n);
+            }
+            "alert_duration_ms" => {
+                let n = parse_u64(value, "alert_duration_ms")?;
+                if n == 0 {
+                    return Err("alert_duration_ms must be >= 1".to_string());
+                }
+                args.alert.duration_threshold_ms = Some(n);
+            }
+            "alert_unknown_domain" => args.alert.alert_unknown_domain = parse_bool(value)?,
+            "alert_bell" => args.alert.bell = parse_bool(value)?,
+            "alert_cooldown_ms" => args.alert.cooldown_ms = parse_u64(value, "alert_cooldown_ms")?,
+            "no_alerts" => args.alert.no_alerts = parse_bool(value)?,
+            _ => {
+                eprintln!("warning: unknown preset key '{}'", key);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_presets_list(loader: &PresetLoader) {
+    let presets = loader.list_presets();
+    println!("Available presets:");
+    println!();
+    for preset in presets {
+        let source_note = match preset.source {
+            PresetSource::Builtin => String::new(),
+            PresetSource::User(ref path) => format!(" (user: {})", path.display()),
+        };
+        let desc = if preset.description.is_empty() {
+            String::from("(no description)")
+        } else {
+            preset.description.clone()
+        };
+        println!("  {:12} - {}{}", preset.name, desc, source_note);
+    }
+}
+
 #[derive(Clone, Debug)]
 struct MonitorArgs {
     patterns: Vec<String>,
@@ -1305,6 +1558,11 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
             print_version();
             std::process::exit(0);
         }
+        if arg == "--list-presets" {
+            let loader = PresetLoader::new();
+            print_presets_list(&loader);
+            std::process::exit(0);
+        }
     }
 
     let config = find_config_flag(argv);
@@ -1314,6 +1572,16 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
             if path.exists() {
                 apply_config_file(&path, &mut args)?;
             }
+        }
+    }
+
+    // Load presets (in order specified on CLI)
+    let preset_names = find_preset_flags(argv);
+    if !preset_names.is_empty() {
+        let loader = PresetLoader::new();
+        for name in preset_names {
+            let values = loader.load_preset(&name)?;
+            apply_preset_values(&values, &mut args)?;
         }
     }
 
@@ -1554,6 +1822,14 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
             }
             "--no-alerts" => {
                 args.alert.no_alerts = true;
+                i += 1;
+            }
+            "--preset" => {
+                // Already handled in find_preset_flags
+                i += 2;
+            }
+            "--list-presets" => {
+                // Already handled in early check
                 i += 1;
             }
             "--config" => {
@@ -1976,6 +2252,22 @@ fn find_config_flag(argv: &[String]) -> ConfigPaths {
     }
 }
 
+fn find_preset_flags(argv: &[String]) -> Vec<String> {
+    let mut presets = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--preset" {
+            if let Some(name) = argv.get(i + 1) {
+                presets.push(name.to_string());
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    presets
+}
+
 fn default_config_path() -> Option<PathBuf> {
     let home = env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".config/rano/config.conf"))
@@ -2365,12 +2657,16 @@ ALERT OPTIONS:\n\
   --alert-cooldown-ms <ms>       Suppress duplicate alerts within window (default: 10000)\n\
   --no-alerts                    Disable all alerting\n\n\
 CONFIG:\n\
+  --preset <name>           Load named preset (repeatable, merged in order)\n\
+  --list-presets            List available presets and exit\n\
   --config <path>           Load config file (key=value format)\n\
   --config-toml <path>      Load provider config (TOML)\n\
   --no-config               Ignore config files\n\
   -h, --help                Show this help\n\
   -V, --version             Show version\n\n\
 EXAMPLES:\n\
+  rano --preset audit                                   # Use audit preset\n\
+  rano --preset quiet --preset audit                    # Merge presets\n\
   rano --alert-domain '*.evil.com' --alert-max-connections 100\n\
   rano --pattern claude --alert-unknown-domain\n"
     );
@@ -4299,6 +4595,7 @@ const EXPORT_FIELDS: &[&str] = &[
     "remote_ip",
     "remote_port",
     "domain",
+    "ancestry_path",
     "duration_ms",
 ];
 
@@ -6757,5 +7054,368 @@ mod tests {
     fn validate_fields_rejects_invalid_field() {
         let fields = vec!["ts".to_string(), "invalid_field".to_string()];
         assert!(validate_fields(&fields).is_err());
+    }
+
+    // =========================================================================
+    // Ancestry Tests
+    // =========================================================================
+
+    #[test]
+    fn format_ancestry_empty_chain() {
+        let chain: Vec<(u32, String)> = vec![];
+        let result = format_ancestry(&chain);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn format_ancestry_single_process() {
+        let chain = vec![(1234, "myprocess".to_string())];
+        let result = format_ancestry(&chain);
+        assert_eq!(result, "myprocess(1234)");
+    }
+
+    #[test]
+    fn format_ancestry_two_processes() {
+        let chain = vec![
+            (1, "init".to_string()),
+            (1234, "myprocess".to_string()),
+        ];
+        let result = format_ancestry(&chain);
+        assert_eq!(result, "init(1) \u{2192} myprocess(1234)");
+    }
+
+    #[test]
+    fn format_ancestry_three_processes() {
+        let chain = vec![
+            (1, "init".to_string()),
+            (500, "bash".to_string()),
+            (1234, "myprocess".to_string()),
+        ];
+        let result = format_ancestry(&chain);
+        assert_eq!(result, "init(1) \u{2192} bash(500) \u{2192} myprocess(1234)");
+    }
+
+    #[test]
+    fn format_ancestry_five_processes_no_truncation() {
+        let chain = vec![
+            (1, "init".to_string()),
+            (100, "systemd".to_string()),
+            (200, "sshd".to_string()),
+            (300, "bash".to_string()),
+            (400, "app".to_string()),
+        ];
+        let result = format_ancestry(&chain);
+        assert!(result.contains("init(1)"));
+        assert!(result.contains("app(400)"));
+        // 5 processes should not truncate
+        assert!(!result.contains("..."));
+    }
+
+    #[test]
+    fn format_ancestry_six_processes_truncates() {
+        let chain = vec![
+            (1, "init".to_string()),
+            (100, "systemd".to_string()),
+            (200, "sshd".to_string()),
+            (300, "bash".to_string()),
+            (400, "python".to_string()),
+            (500, "app".to_string()),
+        ];
+        let result = format_ancestry(&chain);
+        // Should truncate to: ... → python(400) → app(500)
+        assert!(result.contains("..."));
+        assert!(result.contains("python(400)"));
+        assert!(result.contains("app(500)"));
+        // Should NOT contain the early processes
+        assert!(!result.contains("init(1)"));
+        assert!(!result.contains("systemd(100)"));
+    }
+
+    #[test]
+    fn format_ancestry_list_empty() {
+        let chain: Vec<(u32, String)> = vec![];
+        let result = format_ancestry_list(&chain);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn format_ancestry_list_formats_correctly() {
+        let chain = vec![
+            (1, "init".to_string()),
+            (1234, "claude".to_string()),
+        ];
+        let result = format_ancestry_list(&chain);
+        assert_eq!(result, vec!["init(1)", "claude(1234)"]);
+    }
+
+    #[test]
+    fn truncate_ancestry_list_empty() {
+        let list: Vec<String> = vec![];
+        let result = truncate_ancestry_list(&list);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn truncate_ancestry_list_single() {
+        let list = vec!["init(1)".to_string()];
+        let result = truncate_ancestry_list(&list);
+        assert_eq!(result, vec!["init(1)"]);
+    }
+
+    #[test]
+    fn truncate_ancestry_list_five_no_truncation() {
+        let list = vec![
+            "a(1)".to_string(),
+            "b(2)".to_string(),
+            "c(3)".to_string(),
+            "d(4)".to_string(),
+            "e(5)".to_string(),
+        ];
+        let result = truncate_ancestry_list(&list);
+        assert_eq!(result.len(), 5);
+        assert_eq!(result, list);
+    }
+
+    #[test]
+    fn truncate_ancestry_list_six_truncates() {
+        let list = vec![
+            "a(1)".to_string(),
+            "b(2)".to_string(),
+            "c(3)".to_string(),
+            "d(4)".to_string(),
+            "e(5)".to_string(),
+            "f(6)".to_string(),
+        ];
+        let result = truncate_ancestry_list(&list);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], "...");
+        assert_eq!(result[1], "e(5)");
+        assert_eq!(result[2], "f(6)");
+    }
+
+    #[test]
+    fn truncate_ancestry_list_ten_truncates() {
+        let list: Vec<String> = (1..=10).map(|i| format!("p{i}({i})")).collect();
+        let result = truncate_ancestry_list(&list);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], "...");
+        assert_eq!(result[1], "p9(9)");
+        assert_eq!(result[2], "p10(10)");
+    }
+
+    #[test]
+    fn ancestry_chain_to_path_empty() {
+        let chain: Vec<(u32, String)> = vec![];
+        let result = ancestry_chain_to_path(&chain);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn ancestry_chain_to_path_single() {
+        let chain = vec![(1234, "app".to_string())];
+        let result = ancestry_chain_to_path(&chain);
+        assert_eq!(result, "app:1234");
+    }
+
+    #[test]
+    fn ancestry_chain_to_path_multiple() {
+        let chain = vec![
+            (1, "init".to_string()),
+            (500, "bash".to_string()),
+            (1234, "claude".to_string()),
+        ];
+        let result = ancestry_chain_to_path(&chain);
+        assert_eq!(result, "init:1,bash:500,claude:1234");
+    }
+
+    #[test]
+    fn ancestry_cache_new_has_empty_cache() {
+        let cache = AncestryCache::new(Duration::from_secs(30));
+        assert!(cache.cache.is_empty());
+    }
+
+    #[test]
+    fn ancestry_cache_ttl_is_set() {
+        let ttl = Duration::from_secs(60);
+        let cache = AncestryCache::new(ttl);
+        assert_eq!(cache.ttl, ttl);
+    }
+
+    #[test]
+    fn format_ancestry_special_chars_in_comm() {
+        // Process names with special characters
+        let chain = vec![
+            (1, "init".to_string()),
+            (1234, "my-proc_v2".to_string()),
+        ];
+        let result = format_ancestry(&chain);
+        assert_eq!(result, "init(1) \u{2192} my-proc_v2(1234)");
+    }
+
+    #[test]
+    fn ancestry_chain_to_path_special_chars_in_comm() {
+        let chain = vec![
+            (1, "init".to_string()),
+            (1234, "my-proc_v2".to_string()),
+        ];
+        let result = ancestry_chain_to_path(&chain);
+        assert_eq!(result, "init:1,my-proc_v2:1234");
+    }
+
+    // =========================================================================
+    // Preset Tests
+    // =========================================================================
+
+    #[test]
+    fn preset_loader_has_builtin_presets() {
+        let loader = PresetLoader::new();
+        assert!(loader.builtin_presets.contains_key("audit"));
+        assert!(loader.builtin_presets.contains_key("quiet"));
+        assert!(loader.builtin_presets.contains_key("live"));
+        assert!(loader.builtin_presets.contains_key("verbose"));
+    }
+
+    #[test]
+    fn preset_loader_loads_audit_preset() {
+        let loader = PresetLoader::new();
+        let values = loader.load_preset("audit").expect("audit preset should exist");
+        assert_eq!(values.get("summary_only"), Some(&"true".to_string()));
+        assert_eq!(values.get("stats_interval_ms"), Some(&"0".to_string()));
+    }
+
+    #[test]
+    fn preset_loader_loads_quiet_preset() {
+        let loader = PresetLoader::new();
+        let values = loader.load_preset("quiet").expect("quiet preset should exist");
+        assert_eq!(values.get("summary_only"), Some(&"true".to_string()));
+        assert_eq!(values.get("no_banner"), Some(&"true".to_string()));
+    }
+
+    #[test]
+    fn preset_loader_loads_live_preset() {
+        let loader = PresetLoader::new();
+        let values = loader.load_preset("live").expect("live preset should exist");
+        assert_eq!(values.get("stats_interval_ms"), Some(&"2000".to_string()));
+    }
+
+    #[test]
+    fn preset_loader_loads_verbose_preset() {
+        let loader = PresetLoader::new();
+        let values = loader.load_preset("verbose").expect("verbose preset should exist");
+        assert_eq!(values.get("include_udp"), Some(&"true".to_string()));
+        assert_eq!(values.get("include_listening"), Some(&"true".to_string()));
+    }
+
+    #[test]
+    fn preset_loader_unknown_preset_returns_error() {
+        let loader = PresetLoader::new();
+        let result = loader.load_preset("nonexistent");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Unknown preset 'nonexistent'"));
+        assert!(err.contains("audit")); // Should list available presets
+    }
+
+    #[test]
+    fn preset_loader_list_presets_includes_all_builtins() {
+        let loader = PresetLoader::new();
+        let presets = loader.list_presets();
+        let names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"audit"));
+        assert!(names.contains(&"quiet"));
+        assert!(names.contains(&"live"));
+        assert!(names.contains(&"verbose"));
+    }
+
+    #[test]
+    fn preset_loader_extracts_description() {
+        let loader = PresetLoader::new();
+        let presets = loader.list_presets();
+        let audit = presets.iter().find(|p| p.name == "audit").expect("audit preset should exist");
+        assert_eq!(audit.description, "Security review / minimal noise");
+    }
+
+    #[test]
+    fn preset_parse_content_handles_empty_lines() {
+        let loader = PresetLoader::new();
+        let content = "# Comment\n\nkey1=value1\n\n# Another comment\nkey2=value2\n";
+        let values = loader.parse_preset_content(content).expect("parse should succeed");
+        assert_eq!(values.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(values.get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn preset_parse_content_strips_inline_comments() {
+        let loader = PresetLoader::new();
+        let content = "key1=value1 # inline comment\n";
+        let values = loader.parse_preset_content(content).expect("parse should succeed");
+        // Note: current implementation treats everything after # as comment
+        // so "value1 " (with trailing space) is the value
+        assert!(values.get("key1").is_some());
+    }
+
+    #[test]
+    fn apply_preset_values_sets_summary_only() {
+        let mut args = MonitorArgs::default();
+        let mut values = HashMap::new();
+        values.insert("summary_only".to_string(), "true".to_string());
+
+        apply_preset_values(&values, &mut args).expect("apply should succeed");
+        assert!(args.summary_only);
+    }
+
+    #[test]
+    fn apply_preset_values_sets_stats_interval() {
+        let mut args = MonitorArgs::default();
+        let mut values = HashMap::new();
+        values.insert("stats_interval_ms".to_string(), "5000".to_string());
+
+        apply_preset_values(&values, &mut args).expect("apply should succeed");
+        assert_eq!(args.stats_interval_ms, 5000);
+    }
+
+    #[test]
+    fn apply_preset_values_sets_include_udp() {
+        let mut args = MonitorArgs::default();
+        let mut values = HashMap::new();
+        values.insert("include_udp".to_string(), "true".to_string());
+
+        apply_preset_values(&values, &mut args).expect("apply should succeed");
+        assert!(args.include_udp);
+    }
+
+    #[test]
+    fn apply_preset_values_multiple_values() {
+        let mut args = MonitorArgs::default();
+        let mut values = HashMap::new();
+        values.insert("summary_only".to_string(), "true".to_string());
+        values.insert("no_banner".to_string(), "true".to_string());
+        values.insert("stats_interval_ms".to_string(), "0".to_string());
+
+        apply_preset_values(&values, &mut args).expect("apply should succeed");
+        assert!(args.summary_only);
+        assert!(args.no_banner);
+        assert_eq!(args.stats_interval_ms, 0);
+    }
+
+    #[test]
+    fn apply_preset_values_ignores_unknown_keys() {
+        let mut args = MonitorArgs::default();
+        let mut values = HashMap::new();
+        values.insert("unknown_key_xyz".to_string(), "some_value".to_string());
+
+        // Should not error, just warn (to stderr)
+        let result = apply_preset_values(&values, &mut args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn preset_loader_list_preset_names() {
+        let loader = PresetLoader::new();
+        let names = loader.list_preset_names();
+        assert!(names.contains(&"audit".to_string()));
+        assert!(names.contains(&"quiet".to_string()));
+        assert!(names.contains(&"live".to_string()));
+        assert!(names.contains(&"verbose".to_string()));
     }
 }

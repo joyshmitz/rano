@@ -1,0 +1,211 @@
+== E2E Header ==
+  timestamp=2026-01-21T11:03:58Z
+  host=threadripperje
+  os=Linux threadripperje 6.17.0-8-generic #8-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov 14 21:44:46 UTC 2025 x86_64 GNU/Linux
+  rano_version=0.1.0
+  test_name=export-formats
+  args=
+== Setup ==
+  rano=/tmp/cargo-target/debug/rano
+  test_sqlite=/tmp/rano-e2e-export-1289120.sqlite
+  export_csv=/tmp/rano-e2e-export-1289120.csv
+  export_jsonl=/tmp/rano-e2e-export-1289120.jsonl
+== Seed: Create test database ==
+  PASS: Test database seeded with 7 events
+== Test 1: CSV export - all data ==
+== RUN 1: export csv ==
+  cmd=/tmp/cargo-target/debug/rano export --format csv --sqlite /tmp/rano-e2e-export-1289120.sqlite
+  status=0
+  output (truncated):
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
+2026-01-20T10:00:00Z,run-test-1,connect,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,
+2026-01-20T10:00:01Z,run-test-1,connect,openai,1235,codex,/usr/bin/codex,tcp,192.168.1.100,54322,13.107.246.10,443,api.openai.com,,
+2026-01-20T10:00:02Z,run-test-1,close,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,1500
+2026-01-20T10:00:05Z,run-test-1,connect,google,1236,gemini,/usr/bin/gemini,tcp,192.168.1.100,54323,142.250.189.206,443,gemini.google.com,,
+2026-01-20T10:00:10Z,run-test-1,close,openai,1235,codex,/usr/bin/codex,tcp,192.168.1.100,54322,13.107.246.10,443,api.openai.com,,9000
+2026-01-20T10:00:15Z,run-test-1,close,google,1236,gemini,/usr/bin/gemini,tcp,192.168.1.100,54323,142.250.189.206,443,gemini.google.com,,10000
+2026-01-21T09:00:00Z,run-test-2,connect,anthropic,2001,claude,"/usr/bin/claude --special=""value,with,commas""",tcp,192.168.1.100,55001,104.18.32.7,443,api.anthropic.com,,
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=ts,run_id,event,provider
+  PASS: CSV export produces output with header
+  PASS: CSV has expected number of rows (8)
+== Test 2: JSONL export - all data ==
+== RUN 2: export jsonl ==
+  cmd=/tmp/cargo-target/debug/rano export --format jsonl --sqlite /tmp/rano-e2e-export-1289120.sqlite
+  status=0
+  output (truncated):
+{"cmdline":"/usr/bin/claude","comm":"claude","domain":"api.anthropic.com","event":"connect","local_ip":"192.168.1.100","local_port":54321,"pid":1234,"proto":"tcp","provider":"anthropic","remote_ip":"104.18.32.7","remote_port":443,"run_id":"run-test-1","ts":"2026-01-20T10:00:00Z"}
+{"cmdline":"/usr/bin/codex","comm":"codex","domain":"api.openai.com","event":"connect","local_ip":"192.168.1.100","local_port":54322,"pid":1235,"proto":"tcp","provider":"openai","remote_ip":"13.107.246.10","remote_port":443,"run_id":"run-test-1","ts":"2026-01-20T10:00:01Z"}
+{"cmdline":"/usr/bin/claude","comm":"claude","domain":"api.anthropic.com","duration_ms":1500,"event":"close","local_ip":"192.168.1.100","local_port":54321,"pid":1234,"proto":"tcp","provider":"anthropic","remote_ip":"104.18.32.7","remote_port":443,"run_id":"run-test-1","ts":"2026-01-20T10:00:02Z"}
+{"cmdline":"/usr/bin/gemini","comm":"gemini","domain":"gemini.google.com","event":"connect","local_ip":"192.168.1.100","local_port":54323,"pid":1236,"proto":"tcp","provider":"google","remote_ip":"142.250.189.206","remote_port":443,"run_id":"run-test-1","ts":"2026-01-20T10:00:05Z"}
+{"cmdline":"/usr/bin/codex","comm":"codex","domain":"api.openai.com","duration_ms":9000,"event":"close","local_ip":"192.168.1.100","local_port":54322,"pid":1235,"proto":"tcp","provider":"openai","remote_ip":"13.107.246.10","remote_port":443,"run_id":"run-test-1","ts":"2026-01-20T10:00:10Z"}
+{"cmdline":"/usr/bin/gemini","comm":"gemini","domain":"gemini.google.com","duration_ms":10000,"event":"close","local_ip":"192.168.1.100","local_port":54323,"pid":1236,"proto":"tcp","provider":"google","remote_ip":"142.250.189.206","remote_port":443,"run_id":"run-test-1","ts":"2026-01-20T10:00:15Z"}
+{"cmdline":"/usr/bin/claude --special=\"value,with,commas\"","comm":"claude","domain":"api.anthropic.com","event":"connect","local_ip":"192.168.1.100","local_port":55001,"pid":2001,"proto":"tcp","provider":"anthropic","remote_ip":"104.18.32.7","remote_port":443,"run_id":"run-test-2","ts":"2026-01-21T09:00:00Z"}
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=api.anthropic.com
+== ASSERT contains ==
+  expected substring=api.openai.com
+  JSONL output has 7 lines
+  PASS: All JSONL lines are valid JSON
+== Test 3: CSV with time filter (--since) ==
+== RUN 3: export csv since ==
+  cmd=/tmp/cargo-target/debug/rano export --format csv --sqlite /tmp/rano-e2e-export-1289120.sqlite --since 2026-01-21T00:00:00Z
+  status=0
+  output (truncated):
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
+2026-01-21T09:00:00Z,run-test-2,connect,anthropic,2001,claude,"/usr/bin/claude --special=""value,with,commas""",tcp,192.168.1.100,55001,104.18.32.7,443,api.anthropic.com,,
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=run-test-2
+  Filtered CSV has 2 lines
+  PASS: --since filter works
+== Test 4: CSV with time filter (--until) ==
+== RUN 4: export csv until ==
+  cmd=/tmp/cargo-target/debug/rano export --format csv --sqlite /tmp/rano-e2e-export-1289120.sqlite --until 2026-01-20T10:00:03Z
+  status=0
+  output (truncated):
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
+2026-01-20T10:00:00Z,run-test-1,connect,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,
+2026-01-20T10:00:01Z,run-test-1,connect,openai,1235,codex,/usr/bin/codex,tcp,192.168.1.100,54322,13.107.246.10,443,api.openai.com,,
+2026-01-20T10:00:02Z,run-test-1,close,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,1500
+== ASSERT status ==
+  expected=0
+  actual=0
+  Filtered CSV (until) has 4 lines
+  PASS: --until filter works
+== Test 5: CSV with provider filter ==
+== RUN 5: export csv provider ==
+  cmd=/tmp/cargo-target/debug/rano export --format csv --sqlite /tmp/rano-e2e-export-1289120.sqlite --provider anthropic
+  status=0
+  output (truncated):
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
+2026-01-20T10:00:00Z,run-test-1,connect,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,
+2026-01-20T10:00:02Z,run-test-1,close,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,1500
+2026-01-21T09:00:00Z,run-test-2,connect,anthropic,2001,claude,"/usr/bin/claude --special=""value,with,commas""",tcp,192.168.1.100,55001,104.18.32.7,443,api.anthropic.com,,
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=anthropic
+  PASS: --provider filter works
+== Test 6: CSV with domain filter ==
+== RUN 6: export csv domain ==
+  cmd=/tmp/cargo-target/debug/rano export --format csv --sqlite /tmp/rano-e2e-export-1289120.sqlite --domain *.google.com
+  status=0
+  output (truncated):
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
+2026-01-20T10:00:05Z,run-test-1,connect,google,1236,gemini,/usr/bin/gemini,tcp,192.168.1.100,54323,142.250.189.206,443,gemini.google.com,,
+2026-01-20T10:00:15Z,run-test-1,close,google,1236,gemini,/usr/bin/gemini,tcp,192.168.1.100,54323,142.250.189.206,443,gemini.google.com,,10000
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=gemini.google.com
+  PASS: --domain filter works
+== Test 7: CSV with run-id filter ==
+== RUN 7: export csv run-id ==
+  cmd=/tmp/cargo-target/debug/rano export --format csv --sqlite /tmp/rano-e2e-export-1289120.sqlite --run-id run-test-1
+  status=0
+  output (truncated):
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
+2026-01-20T10:00:00Z,run-test-1,connect,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,
+2026-01-20T10:00:01Z,run-test-1,connect,openai,1235,codex,/usr/bin/codex,tcp,192.168.1.100,54322,13.107.246.10,443,api.openai.com,,
+2026-01-20T10:00:02Z,run-test-1,close,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,1500
+2026-01-20T10:00:05Z,run-test-1,connect,google,1236,gemini,/usr/bin/gemini,tcp,192.168.1.100,54323,142.250.189.206,443,gemini.google.com,,
+2026-01-20T10:00:10Z,run-test-1,close,openai,1235,codex,/usr/bin/codex,tcp,192.168.1.100,54322,13.107.246.10,443,api.openai.com,,9000
+2026-01-20T10:00:15Z,run-test-1,close,google,1236,gemini,/usr/bin/gemini,tcp,192.168.1.100,54323,142.250.189.206,443,gemini.google.com,,10000
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=run-test-1
+  PASS: --run-id filter works
+== Test 8: CSV with --no-header ==
+== RUN 8: export csv no-header ==
+  cmd=/tmp/cargo-target/debug/rano export --format csv --sqlite /tmp/rano-e2e-export-1289120.sqlite --no-header
+  status=0
+  output (truncated):
+2026-01-20T10:00:00Z,run-test-1,connect,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,
+2026-01-20T10:00:01Z,run-test-1,connect,openai,1235,codex,/usr/bin/codex,tcp,192.168.1.100,54322,13.107.246.10,443,api.openai.com,,
+2026-01-20T10:00:02Z,run-test-1,close,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,1500
+2026-01-20T10:00:05Z,run-test-1,connect,google,1236,gemini,/usr/bin/gemini,tcp,192.168.1.100,54323,142.250.189.206,443,gemini.google.com,,
+2026-01-20T10:00:10Z,run-test-1,close,openai,1235,codex,/usr/bin/codex,tcp,192.168.1.100,54322,13.107.246.10,443,api.openai.com,,9000
+2026-01-20T10:00:15Z,run-test-1,close,google,1236,gemini,/usr/bin/gemini,tcp,192.168.1.100,54323,142.250.189.206,443,gemini.google.com,,10000
+2026-01-21T09:00:00Z,run-test-2,connect,anthropic,2001,claude,"/usr/bin/claude --special=""value,with,commas""",tcp,192.168.1.100,55001,104.18.32.7,443,api.anthropic.com,,
+== ASSERT status ==
+  expected=0
+  actual=0
+  PASS: --no-header suppresses header
+== Test 9: Empty result set handling ==
+== RUN 9: export csv empty ==
+  cmd=/tmp/cargo-target/debug/rano export --format csv --sqlite /tmp/rano-e2e-export-1289120.sqlite --since 2030-01-01T00:00:00Z
+  status=0
+  output (truncated):
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
+== ASSERT status ==
+  expected=0
+  actual=0
+  PASS: Empty result set handled gracefully
+== Test 10: Special characters escaped correctly ==
+== RUN 10: export csv special ==
+  cmd=/tmp/cargo-target/debug/rano export --format csv --sqlite /tmp/rano-e2e-export-1289120.sqlite --run-id run-test-2
+  status=0
+  output (truncated):
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
+2026-01-21T09:00:00Z,run-test-2,connect,anthropic,2001,claude,"/usr/bin/claude --special=""value,with,commas""",tcp,192.168.1.100,55001,104.18.32.7,443,api.anthropic.com,,
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=special=
+  PASS: Special characters in fields are handled
+== Test 11: Combined filters ==
+== RUN 11: export combined ==
+  cmd=/tmp/cargo-target/debug/rano export --format csv --sqlite /tmp/rano-e2e-export-1289120.sqlite --since 2026-01-20T00:00:00Z --until 2026-01-21T00:00:00Z --provider anthropic
+  status=0
+  output (truncated):
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
+2026-01-20T10:00:00Z,run-test-1,connect,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,
+2026-01-20T10:00:02Z,run-test-1,close,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,1500
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=anthropic
+== ASSERT contains ==
+  expected substring=run-test-1
+  PASS: Combined filters work together
+== Test 12: JSONL empty result ==
+== RUN 12: export jsonl empty ==
+  cmd=/tmp/cargo-target/debug/rano export --format jsonl --sqlite /tmp/rano-e2e-export-1289120.sqlite --since 2030-01-01T00:00:00Z
+  status=0
+  output (truncated):
+== ASSERT status ==
+  expected=0
+  actual=0
+  PASS: Empty JSONL produces no output
+== Summary ==
+  All E2E export format tests passed
+  Tests verified:
+    - CSV export with header
+    - JSONL export with valid JSON
+    - --since filter
+    - --until filter
+    - --provider filter
+    - --domain filter
+    - --run-id filter
+    - --no-header option
+    - Empty result set handling
+    - Special characters escaped
+    - Combined filters
+== E2E PASS ==
+  log=logs/e2e/export-formats-20260121T110358Z.log
+  duration_seconds=0

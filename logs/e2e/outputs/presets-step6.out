@@ -1,0 +1,2 @@
+error: Unknown preset 'nonexistent'. Available: audit, live, quiet, verbose
+Run `rano --help` for usage.

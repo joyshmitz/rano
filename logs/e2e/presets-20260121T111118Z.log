@@ -1,0 +1,188 @@
+== E2E Header ==
+  timestamp=2026-01-21T11:11:18Z
+  host=threadripperje
+  os=Linux threadripperje 6.17.0-8-generic #8-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov 14 21:44:46 UTC 2025 x86_64 GNU/Linux
+  rano_version=0.1.0
+  test_name=presets
+  args=
+== Setup ==
+  rano=/tmp/cargo-target/debug/rano
+== Test 1: --list-presets shows built-in presets ==
+== RUN 1: list presets ==
+  cmd=/tmp/cargo-target/debug/rano --list-presets
+  status=0
+  output (truncated):
+Available presets:
+
+  audit        - Security review / minimal noise
+  live         - Real-time monitoring focus
+  quiet        - Reduce terminal output
+  verbose      - Maximum detail
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=audit
+== ASSERT contains ==
+  expected substring=quiet
+== ASSERT contains ==
+  expected substring=live
+== ASSERT contains ==
+  expected substring=verbose
+== ASSERT contains ==
+  expected substring=Available presets:
+  PASS: --list-presets shows all built-in presets
+== Test 2: audit preset loads successfully ==
+== RUN 2: preset audit ==
+  cmd=/tmp/cargo-target/debug/rano --preset audit --pattern nonexistent --once --no-banner
+  status=0
+  output (truncated):
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=Summary
+  PASS: audit preset loads and runs
+== Test 3: quiet preset loads successfully ==
+== RUN 3: preset quiet ==
+  cmd=/tmp/cargo-target/debug/rano --preset quiet --pattern nonexistent --once
+  status=0
+  output (truncated):
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=Summary
+  PASS: quiet preset loads and runs
+== Test 4: live preset loads successfully ==
+== RUN 4: preset live ==
+  cmd=/tmp/cargo-target/debug/rano --preset live --pattern nonexistent --once --no-banner
+  status=0
+  output (truncated):
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=Summary
+  PASS: live preset loads and runs
+== Test 5: verbose preset loads successfully ==
+== RUN 5: preset verbose ==
+  cmd=/tmp/cargo-target/debug/rano --preset verbose --pattern nonexistent --once
+  status=0
+  output (truncated):
+rano patterns=[nonexistent] interval=1000ms json=false domain=ptr udp=true listening=true once=true sqlite=observer.sqlite stats=1000ms log_file=- log_dir=-
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=udp=true
+  PASS: verbose preset loads and runs
+== Test 6: Unknown preset returns error ==
+== RUN 6: preset unknown ==
+  cmd=/tmp/cargo-target/debug/rano --preset nonexistent --pattern test --once
+  status=1
+  output (truncated):
+error: Unknown preset 'nonexistent'. Available: audit, live, quiet, verbose
+Run `rano --help` for usage.
+== ASSERT contains ==
+  expected substring=Unknown preset 'nonexistent'
+== ASSERT contains ==
+  expected substring=audit
+  PASS: Unknown preset returns helpful error
+== Test 7: Preset descriptions in --list-presets ==
+== RUN 7: list with descriptions ==
+  cmd=/tmp/cargo-target/debug/rano --list-presets
+  status=0
+  output (truncated):
+Available presets:
+
+  audit        - Security review / minimal noise
+  live         - Real-time monitoring focus
+  quiet        - Reduce terminal output
+  verbose      - Maximum detail
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=Security review
+== ASSERT contains ==
+  expected substring=Reduce terminal output
+== ASSERT contains ==
+  expected substring=Real-time monitoring
+== ASSERT contains ==
+  expected substring=Maximum detail
+  PASS: Preset descriptions are shown
+== Test 8: CLI flags override preset values ==
+== RUN 8: cli override ==
+  cmd=/tmp/cargo-target/debug/rano --preset verbose --pattern nonexistent --once --stats-interval-ms 5000
+  status=0
+  output (truncated):
+rano patterns=[nonexistent] interval=1000ms json=false domain=ptr udp=true listening=true once=true sqlite=observer.sqlite stats=5000ms log_file=- log_dir=-
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=stats=5000ms
+  PASS: CLI flags override preset values
+== Test 9: Multiple presets merge in order ==
+== RUN 9: merge presets ==
+  cmd=/tmp/cargo-target/debug/rano --preset audit --preset verbose --pattern nonexistent --once
+  status=0
+  output (truncated):
+rano patterns=[nonexistent] interval=1000ms json=false domain=ptr udp=true listening=true once=true sqlite=observer.sqlite stats=1000ms log_file=- log_dir=-
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=stats=1000ms
+  PASS: Multiple presets merge in order (later wins)
+== Test 10: Custom user preset ==
+  Created custom preset at /tmp/tmp.5cjlJ5oXm1/custom.conf
+== RUN 10: custom preset ==
+  cmd=/tmp/cargo-target/debug/rano --preset custom --pattern nonexistent --once
+  status=0
+  output (truncated):
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=stats=3333ms
+  actual output (truncated):
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== E2E FAIL ==
+  reason=output missing expected substring
+  log=logs/e2e/presets-20260121T111118Z.log
+== E2E FAIL ==
+  reason=test script exited non-zero
+  log=logs/e2e/presets-20260121T111118Z.log

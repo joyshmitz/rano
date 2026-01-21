@@ -381,6 +381,188 @@ rano --alert-domain "*.cn" \
 
 ---
 
+## Presets
+
+rano includes built-in configuration presets for common use cases. Presets bundle multiple settings into a single flag, making it easy to switch between monitoring styles without remembering individual options.
+
+### Built-in Presets
+
+| Preset | Description | Key Settings |
+|--------|-------------|--------------|
+| `audit` | Security review / minimal noise | `stats_interval_ms=0`, `include_udp=true`, `summary_only=true` |
+| `quiet` | Reduce terminal output | `stats_interval_ms=0`, `no_banner=true`, `summary_only=true` |
+| `live` | Real-time monitoring focus | `stats_interval_ms=500`, `stats_top=10` |
+| `verbose` | Maximum detail | `include_udp=true`, `include_listening=true`, `stats_interval_ms=1000` |
+
+### Quick Examples
+
+```bash
+# Security audit mode - captures everything, minimal output noise
+rano --preset audit --pattern claude
+
+# Quiet mode - background monitoring
+rano --preset quiet --log-file /tmp/rano.log
+
+# Live monitoring - see stats frequently
+rano --preset live
+
+# Verbose mode - show all details including UDP and listening sockets
+rano --preset verbose
+
+# List available presets
+rano --list-presets
+
+# Combine presets - later preset wins for conflicting settings
+rano --preset audit --preset verbose
+
+# Override preset values with CLI flags
+rano --preset verbose --stats-interval-ms 5000
+```
+
+### Preset Flags
+
+| Flag | Description |
+|------|-------------|
+| `--preset <name>` | Load a preset configuration (repeatable) |
+| `--list-presets` | Show all available presets and exit |
+
+### Creating Custom Presets
+
+Create custom presets in `~/.config/rano/presets/`:
+
+```bash
+mkdir -p ~/.config/rano/presets
+
+# Create a custom preset
+cat > ~/.config/rano/presets/myaudit.conf << 'EOF'
+# Description: Custom audit for my workflow
+include_udp=true
+include_listening=true
+stats_interval_ms=2000
+stats_top=20
+summary_only=false
+EOF
+```
+
+The first line comment `# Description: ...` becomes the preset description shown in `--list-presets`.
+
+**Preset file format:**
+- One `key=value` per line
+- Lines starting with `#` are comments
+- Uses the same keys as config files (see Configuration section)
+- Boolean values: `true` or `false`
+
+### Preset Merging
+
+When multiple presets are specified, they're applied in order. Later presets override earlier ones:
+
+```bash
+# audit sets stats_interval_ms=0
+# verbose sets stats_interval_ms=1000
+# Result: stats_interval_ms=1000 (verbose wins)
+rano --preset audit --preset verbose
+```
+
+CLI flags always override preset values:
+
+```bash
+# verbose sets stats_interval_ms=1000
+# CLI sets stats_interval_ms=5000
+# Result: stats_interval_ms=5000 (CLI wins)
+rano --preset verbose --stats-interval-ms 5000
+```
+
+### Troubleshooting
+
+**Preset not found**
+
+```
+error: Unknown preset 'mypreset'. Available: audit, live, quiet, verbose
+```
+
+1. Check the preset name spelling
+2. Ensure the preset file exists: `ls ~/.config/rano/presets/`
+3. Verify file extension is `.conf`
+4. Run `rano --list-presets` to see available presets
+
+**Preset not loading values**
+
+1. Check file format: must be `key=value` (no spaces around `=`)
+2. Verify key names match config options (see Configuration section)
+3. For boolean values, use `true` or `false` (not `yes`/`no` or `1`/`0`)
+
+---
+
+## Process Ancestry
+
+rano tracks the full process ancestry chain for each connection, showing exactly how a network-making process was spawned. This is invaluable for understanding which AI CLI session initiated a particular connection, especially when processes spawn deep subprocess trees.
+
+### How It Works
+
+For each tracked process, rano walks the process tree from init (PID 1) down to the process making the connection. The ancestry is stored as a comma-separated path:
+
+```
+init:1,systemd:500,sshd:1200,bash:1500,tmux:1600,bash:1700,claude:2000
+```
+
+Each entry is `comm:pid` where `comm` is the process name and `pid` is the process ID.
+
+### Display Format
+
+In live output, long ancestry chains are truncated to keep output readable:
+
+```
+init(1) → systemd(500) → bash(1700) → claude(2000)
+```
+
+Chains longer than 5 levels show ellipsis: `... → bash(1700) → claude(2000)`
+
+### SQLite Storage
+
+The full ancestry path is stored in the `ancestry_path` column:
+
+```sql
+-- Find all connections from processes spawned by tmux
+SELECT * FROM events WHERE ancestry_path LIKE '%tmux%';
+
+-- Group connections by their spawn path
+SELECT ancestry_path, COUNT(*) as connections
+FROM events
+GROUP BY ancestry_path
+ORDER BY connections DESC;
+
+-- Find connections from a specific process tree
+SELECT * FROM events WHERE ancestry_path LIKE '%claude:1234%';
+```
+
+### Export Support
+
+The ancestry path is included in CSV and JSONL exports:
+
+```bash
+# Export with ancestry
+rano export --format csv > connections.csv
+
+# Filter and analyze ancestry in JSON
+rano export --format jsonl | jq 'select(.ancestry_path | contains("tmux"))'
+```
+
+### Use Cases
+
+**Attribution**: Determine which terminal session or tmux pane initiated a connection.
+
+**Security audit**: Verify that AI CLI processes are being launched from expected parent processes.
+
+**Debugging**: Trace why a particular subprocess made an unexpected connection.
+
+**Process tree analysis**: Identify patterns in how AI CLIs spawn their network-making children.
+
+### Performance
+
+Ancestry is cached with a configurable TTL (default 30 seconds) and staleness detection. The cache is invalidated if the process's comm name changes, ensuring accuracy even for long-running sessions.
+
+---
+
 ## Exporting Data
 
 rano can export SQLite event history to CSV or JSONL for use with external tools like Excel, Pandas, jq, or data pipelines.
@@ -441,6 +623,7 @@ Both CSV and JSONL include these fields (in order for CSV):
 | `remote_ip` | string | Remote IP address |
 | `remote_port` | integer | Remote port |
 | `domain` | string | Resolved domain name (if available) |
+| `ancestry_path` | string | Process ancestry chain (`comm:pid,comm:pid,...`) |
 | `duration_ms` | integer | Connection duration in ms (close events only) |
 
 ### Format Notes

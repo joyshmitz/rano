@@ -1,0 +1,2 @@
+idx_events_ancestry_path  idx_events_provider       idx_events_run_id       
+idx_events_domain         idx_events_remote_ip      idx_events_ts           

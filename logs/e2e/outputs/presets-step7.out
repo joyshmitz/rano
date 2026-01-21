@@ -1,0 +1,6 @@
+Available presets:
+
+  audit        - Security review / minimal noise
+  live         - Real-time monitoring focus
+  quiet        - Reduce terminal output
+  verbose      - Maximum detail

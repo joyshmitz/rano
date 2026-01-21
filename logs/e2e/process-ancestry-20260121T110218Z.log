@@ -1,0 +1,89 @@
+== E2E Header ==
+  timestamp=2026-01-21T11:02:18Z
+  host=threadripperje
+  os=Linux threadripperje 6.17.0-8-generic #8-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov 14 21:44:46 UTC 2025 x86_64 GNU/Linux
+  rano_version=0.1.0
+  test_name=process-ancestry
+  args=
+== Setup ==
+  rano=/tmp/cargo-target/debug/rano
+  test_sqlite=/tmp/rano-e2e-ancestry-1274650.sqlite
+== Test 1: SQLite schema includes ancestry_path column ==
+== RUN 1: create db ==
+  cmd=/tmp/cargo-target/debug/rano --pattern nonexistent-process-xyz --sqlite /tmp/rano-e2e-ancestry-1274650.sqlite --once --no-banner
+  status=0
+  output (truncated):
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== RUN 2: check schema ==
+  cmd=sqlite3 /tmp/rano-e2e-ancestry-1274650.sqlite .schema events
+  status=0
+  output (truncated):
+CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            run_id TEXT,
+            event TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            pid INTEGER,
+            comm TEXT,
+            cmdline TEXT,
+            proto TEXT,
+            local_ip TEXT,
+            local_port INTEGER,
+            remote_ip TEXT,
+            remote_port INTEGER,
+            domain TEXT,
+            ancestry_path TEXT,
+            remote_is_private INTEGER,
+            ip_version INTEGER,
+            duration_ms INTEGER
+        , alert INTEGER);
+CREATE INDEX idx_events_ts ON events(ts);
+CREATE INDEX idx_events_run_id ON events(run_id);
+CREATE INDEX idx_events_provider ON events(provider);
+CREATE INDEX idx_events_remote_ip ON events(remote_ip);
+CREATE INDEX idx_events_domain ON events(domain);
+CREATE INDEX idx_events_ancestry_path ON events(ancestry_path);
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=ancestry_path
+  PASS: SQLite events table has ancestry_path column
+== Test 2: SQLite ancestry index exists ==
+== RUN 3: check indices ==
+  cmd=sqlite3 /tmp/rano-e2e-ancestry-1274650.sqlite .indices events
+  status=0
+  output (truncated):
+idx_events_ancestry_path  idx_events_provider       idx_events_run_id       
+idx_events_domain         idx_events_remote_ip      idx_events_ts           
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=idx_events_ancestry_path
+  PASS: ancestry_path index exists
+== Test 3: Ancestry path appears in CSV export ==
+== RUN 4: export csv ==
+  cmd=/tmp/cargo-target/debug/rano export --format csv --sqlite /tmp/rano-e2e-ancestry-1274650.sqlite --run-id test-run-ancestry
+  status=0
+  output (truncated):
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,duration_ms
+2026-01-20T12:00:00Z,test-run-ancestry,connect,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=ancestry_path
+  actual output (truncated):
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,duration_ms
+2026-01-20T12:00:00Z,test-run-ancestry,connect,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,
+== E2E FAIL ==
+  reason=output missing expected substring
+  log=logs/e2e/process-ancestry-20260121T110218Z.log
+== E2E FAIL ==
+  reason=test script exited non-zero
+  log=logs/e2e/process-ancestry-20260121T110218Z.log
