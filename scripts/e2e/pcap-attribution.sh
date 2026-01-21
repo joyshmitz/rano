@@ -105,6 +105,7 @@ if grep -Fq "pcap feature not enabled" "${E2E_LAST_OUTPUT_FILE}"; then
   e2e_fail "pcap feature not enabled. Build with: cargo build --features pcap"
 fi
 
+e2e_assert_last_contains "\"domain_mode\":\"ptr\""
 e2e_assert_last_contains "warning: pcap capture unavailable"
 e2e_assert_last_contains "pcap capture requires elevated privileges"
 
