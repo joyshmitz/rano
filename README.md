@@ -691,6 +691,108 @@ df.groupby("provider")["event"].count()
 
 ---
 
+## Configuration Validation
+
+rano provides built-in configuration validation to catch errors and typos before runtime. The `config` subcommand helps you verify, inspect, and troubleshoot your configuration.
+
+### Quick Examples
+
+```bash
+# Validate all config files
+rano config check
+
+# Show resolved configuration
+rano config show
+
+# Show configuration as JSON
+rano config show --json
+
+# List config file search paths
+rano config paths
+```
+
+### Config Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| `config check` | Validate all config files and report errors/warnings |
+| `config show` | Display the resolved configuration (all sources merged) |
+| `config show --json` | Output resolved configuration as JSON |
+| `config paths` | Show where rano looks for config files |
+
+### Validation Output
+
+**Errors** (prevent rano from starting):
+```
+1 error(s) found:
+  ✗ /home/user/.config/rano/config.conf:3: 'interval_ms' must be a non-negative integer, got 'abc'
+```
+
+**Warnings** (rano will run but may not behave as expected):
+```
+1 warning(s) found:
+  ⚠ /home/user/.config/rano/config.conf:5: unknown key 'intervall_ms' (possible typo?)
+```
+
+### What Gets Validated
+
+| Check | Example Error |
+|-------|---------------|
+| Unknown keys | `unknown key 'intervall_ms' (possible typo?)` |
+| Invalid numbers | `'interval_ms' must be a non-negative integer, got 'abc'` |
+| Invalid booleans | `'json' must be a boolean (true/false/yes/no/1/0), got 'maybe'` |
+| Invalid enum values | `'domain_mode' must be one of [auto, ptr, pcap], got 'invalid'` |
+| Zero where >= 1 required | `'db_batch_size' must be >= 1, got 0` |
+| Invalid stats_view | `'stats_view' contains invalid value 'invalid'` |
+| TOML syntax errors | `TOML parse error: expected `]`...` |
+| Invalid provider mode | `providers.mode must be one of [merge, replace], got 'bad'` |
+| Missing parent directory | `log_file parent directory '/nonexistent' does not exist` |
+
+### Workflow
+
+1. **Create or edit config**:
+   ```bash
+   vim ~/.config/rano/config.conf
+   ```
+
+2. **Validate before running**:
+   ```bash
+   rano config check
+   ```
+
+3. **If errors, fix and re-validate**:
+   ```
+   1 error(s) found:
+     ✗ config.conf:3: 'json' must be a boolean...
+   ```
+
+4. **Once valid, run rano**:
+   ```bash
+   rano --pattern claude
+   ```
+
+### Common Issues and Fixes
+
+| Issue | Fix |
+|-------|-----|
+| `unknown key 'intervall_ms'` | Fix typo: `interval_ms` |
+| `must be a boolean` | Use `true`, `false`, `1`, `0`, `yes`, or `no` |
+| `must be one of [auto, ptr, pcap]` | Use a valid value from the list |
+| `TOML parse error` | Check TOML syntax (missing quotes, brackets) |
+| `must be >= 1` | Use a positive integer (not 0) |
+
+### E2E Testing
+
+Config validation is tested via the E2E harness:
+
+```bash
+scripts/e2e/run.sh config-validation scripts/e2e/config-validation.sh
+```
+
+Logs are written to `logs/e2e/config-validation-*.log`.
+
+---
+
 ## Configuration
 
 Default path: `~/.config/rano/config.conf`
