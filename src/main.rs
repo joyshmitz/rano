@@ -357,6 +357,20 @@ fn apply_preset_values(
             "alert_bell" => args.alert.bell = parse_bool(value)?,
             "alert_cooldown_ms" => args.alert.cooldown_ms = parse_u64(value, "alert_cooldown_ms")?,
             "no_alerts" => args.alert.no_alerts = parse_bool(value)?,
+            "retry_threshold" => {
+                let n = parse_usize(value, "retry_threshold")?;
+                if n == 0 {
+                    return Err("retry_threshold must be >= 1".to_string());
+                }
+                args.retry_threshold = n;
+            }
+            "retry_window_ms" => {
+                let n = parse_u64(value, "retry_window_ms")?;
+                if n == 0 {
+                    return Err("retry_window_ms must be >= 1".to_string());
+                }
+                args.retry_window_ms = n;
+            }
             _ => {
                 eprintln!("warning: unknown preset key '{}'", key);
             }
@@ -2531,6 +2545,20 @@ fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> 
             "alert_bell" => args.alert.bell = parse_bool(value)?,
             "alert_cooldown_ms" => args.alert.cooldown_ms = parse_u64(value, "alert_cooldown_ms")?,
             "no_alerts" => args.alert.no_alerts = parse_bool(value)?,
+            "retry_threshold" => {
+                let n = parse_usize(value, "retry_threshold")?;
+                if n == 0 {
+                    return Err("retry_threshold must be >= 1".to_string());
+                }
+                args.retry_threshold = n;
+            }
+            "retry_window_ms" => {
+                let n = parse_u64(value, "retry_window_ms")?;
+                if n == 0 {
+                    return Err("retry_window_ms must be >= 1".to_string());
+                }
+                args.retry_window_ms = n;
+            }
             _ => {
                 eprintln!(
                     "warning: unknown config key '{}' in {}", key, path.display()

@@ -92,7 +92,7 @@ sqlite3 observer.sqlite "select * from provider_counts;"
 
 **When to use rano:** monitor AI CLI network behavior during dev or audits.
 
-**When it might not fit:** you need full DNS/SNI capture or packet-level inspection.
+**When it might not fit:** you need full packet capture, payload inspection, or decrypted TLS analysis.
 
 ---
 
@@ -210,6 +210,32 @@ rano --once
 --no-banner
 --config <path>           # Load key=value config
 --no-config
+```
+
+### Domain Attribution Modes
+
+rano can resolve domains in two modes:
+
+- **PTR (default)**: reverse DNS lookups. No elevated privileges required.
+- **pcap**: uses libpcap to capture DNS responses + TLS SNI. Requires root/CAP_NET_RAW.
+  If capture fails, rano logs a warning and falls back to PTR automatically.
+
+Examples:
+
+```bash
+# Prefer pcap attribution (falls back if unavailable)
+rano --domain-mode pcap
+rano --pcap --pattern claude
+
+# Force PTR mode (no packet capture)
+rano --domain-mode ptr
+```
+
+Offline verification (no root) is supported via a pcap file:
+
+```bash
+RANO_PCAP_FILE=tests/fixtures/pcap/dns-fixture.pcap \
+  rano --pcap --once --json --no-banner
 ```
 
 ### `rano update`
@@ -805,7 +831,8 @@ rano --pattern myprocess --once 2>&1 | grep provider
 
 ### "warning: pcap capture requires elevated privileges"
 
-You requested pcap mode. Run as root or use PTR mode instead.
+You requested pcap mode. Run as root or grant `CAP_NET_RAW`, or switch to PTR mode.
+rano will log the warning and fall back to PTR automatically.
 
 ```bash
 rano --domain-mode ptr
@@ -846,13 +873,25 @@ Stats are suppressed when JSON output is enabled or when `--stats-interval-ms 0`
 rano --stats-interval-ms 2000
 ```
 
+### Verify pcap attribution (E2E)
+
+The offline pcap test uses the shared harness and writes logs to `logs/e2e/`:
+
+```bash
+scripts/e2e/run.sh pcap-attribution scripts/e2e/pcap-attribution.sh
+```
+
+Logs:
+- `logs/e2e/pcap-attribution-<timestamp>.log`
+- `logs/e2e/outputs/` for full command output
+
 ---
 
 ## Limitations
 
 ### What rano Doesn’t Do (Yet)
 
-- **True DNS/SNI attribution**: PTR lookups are best-effort and may not match original hostnames.
+- **Perfect hostname attribution**: pcap relies on observed DNS/SNI; some flows still resolve via PTR or remain `unknown`.
 - **Packet-level inspection**: it’s not a packet sniffer; use tcpdump/wireshark for payloads.
 - **Windows `/proc` parity**: primary monitoring relies on `/proc`, so non-Linux support is limited.
 
@@ -866,7 +905,9 @@ Short for **rust_agent_network_observer**.
 
 ### Does it require root?
 
-No for PTR mode. Pcap mode (planned) typically needs elevated privileges.
+No for PTR mode. Pcap mode uses libpcap and typically needs root/CAP_NET_RAW, but it
+falls back to PTR automatically if capture is unavailable. Offline pcap replay can
+be done without privileges via `RANO_PCAP_FILE`.
 
 ### Can I monitor a single PID without descendants?
 
