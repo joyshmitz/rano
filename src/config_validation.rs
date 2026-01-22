@@ -6,6 +6,9 @@
 //! - Path validation (log directories, SQLite paths)
 //! - Pattern validation (glob/regex compilation)
 
+#![allow(dead_code)]
+#![allow(clippy::collapsible_if)]
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};

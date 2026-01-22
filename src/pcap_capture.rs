@@ -1,4 +1,5 @@
 #![cfg_attr(not(feature = "pcap"), allow(dead_code))]
+#![allow(clippy::collapsible_if)]
 
 use std::collections::HashMap;
 use std::net::IpAddr;
