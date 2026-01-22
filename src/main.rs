@@ -938,10 +938,11 @@ struct RunContext {
     args_snapshot: String,
     interval_ms: u64,
     stats_interval_ms: u64,
+    session_name: String,
 }
 
 impl RunContext {
-    fn new(args: &MonitorArgs, domain_label: &str) -> Self {
+    fn new(args: &MonitorArgs, domain_label: &str, primary_provider: Option<Provider>) -> Self {
         let start_ts = now_rfc3339();
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -952,6 +953,10 @@ impl RunContext {
         let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
         let args_snapshot = env::args().collect::<Vec<_>>().join(" ");
         let patterns = args.patterns.join(", ");
+        // Generate session name or use override
+        let session_name = args.session_name.clone().unwrap_or_else(|| {
+            generate_session_name(&args.patterns, primary_provider.unwrap_or(Provider::Unknown))
+        });
         Self {
             run_id,
             start_ts,
@@ -962,8 +967,55 @@ impl RunContext {
             args_snapshot,
             interval_ms: args.interval_ms,
             stats_interval_ms: args.stats_interval_ms,
+            session_name,
         }
     }
+}
+
+/// Generate a human-friendly session name based on time, provider, and pattern.
+/// Format: '{time}-{provider}-{pattern}-{date}'
+fn generate_session_name(patterns: &[String], primary_provider: Provider) -> String {
+    // Get current local time using libc
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::localtime_r(&now_secs, &mut tm);
+    }
+
+    let hour = tm.tm_hour as u32;
+
+    // Time of day
+    let time_of_day = match hour {
+        0..=5 => "night",
+        6..=11 => "morning",
+        12..=17 => "afternoon",
+        _ => "evening",
+    };
+
+    // Provider label
+    let provider_label = match primary_provider {
+        Provider::Anthropic => "anthropic",
+        Provider::OpenAI => "openai",
+        Provider::Google => "google",
+        Provider::Unknown => "mixed",
+    };
+
+    // First pattern or 'default'
+    let pattern = patterns.first()
+        .map(|p| p.to_lowercase())
+        .unwrap_or_else(|| "default".to_string());
+
+    // Date in YYYY-MM-DD format
+    let year = tm.tm_year + 1900;
+    let month = tm.tm_mon + 1;
+    let day = tm.tm_mday;
+    let date = format!("{:04}-{:02}-{:02}", year, month, day);
+
+    format!("{}-{}-{}-{}", time_of_day, provider_label, pattern, date)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1332,6 +1384,13 @@ fn main() {
                 }
                 return;
             }
+            Command::Status(status_args) => {
+                if let Err(err) = run_status(status_args) {
+                    eprintln!("error: {}", err);
+                    std::process::exit(1);
+                }
+                return;
+            }
         }
     }
 
@@ -1409,7 +1468,7 @@ fn main() {
     let resolved_log_format = log_format_for_output(args.json, args.log_format);
     let log_writer = open_log_writer(&args, &domain_label, resolved_log_format);
 
-    let run_ctx = RunContext::new(&args, domain_label);
+    let run_ctx = RunContext::new(&args, domain_label, None);
 
     let sqlite_writer = if args.no_sqlite {
         None
@@ -2071,6 +2130,12 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 args.no_banner = true;
                 i += 1;
             }
+            "--session-name" => {
+                i += 1;
+                let value = require_value(argv, i, "--session-name")?;
+                args.session_name = Some(value.to_string());
+                i += 1;
+            }
             "--theme" => {
                 i += 1;
                 let value = require_value(argv, i, "--theme")?;
@@ -2558,6 +2623,54 @@ fn parse_diff_args(argv: &[String]) -> Result<DiffArgs, String> {
     }
     if !new_set {
         return Err("--new <run-id> is required".to_string());
+    }
+
+    Ok(args)
+}
+
+fn parse_status_args(argv: &[String]) -> Result<StatusArgs, String> {
+    for arg in argv {
+        if arg == "-h" || arg == "--help" {
+            print_status_help();
+            std::process::exit(0);
+        }
+        if arg == "-V" || arg == "--version" {
+            print_version();
+            std::process::exit(0);
+        }
+    }
+
+    let mut args = StatusArgs::default();
+    // Default to one_line since this is the primary use case
+    args.one_line = true;
+
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        match arg.as_str() {
+            "--one-line" => {
+                args.one_line = true;
+                i += 1;
+            }
+            "--format" => {
+                i += 1;
+                let value = require_value(argv, i, "--format")?;
+                args.format = Some(value.to_string());
+                i += 1;
+            }
+            "--sqlite" => {
+                i += 1;
+                let value = require_value(argv, i, "--sqlite")?;
+                args.sqlite_path = value.to_string();
+                i += 1;
+            }
+            other => {
+                if other.starts_with('-') {
+                    return Err(format!("Unknown status flag: {}", other));
+                }
+                return Err(format!("Unexpected status argument: {}", other));
+            }
+        }
     }
 
     Ok(args)
@@ -3095,6 +3208,7 @@ OPTIONS:\n\
   --stats-top <n>           Top-N domains/IPs in stats/summary\n\
   --stats-view <name>       Stats view: provider|domain|port|process (repeatable)\n\
   --stats-cycle-ms <ms>     Rotate stats views at this interval (0 disables)\n\
+  --session-name <name>     Override auto-generated session name\n\
   --no-banner               Suppress startup banner\n\n\
 ALERT OPTIONS:\n\
   --alert-domain <pattern>       Alert on domains matching glob pattern (repeatable)\n\
@@ -3220,6 +3334,38 @@ EXAMPLES:\n\
   rano diff --old abc123 --new def456\n\
   rano diff --old morning-claude-audit-2026-01-20 --new afternoon-claude-audit-2026-01-20\n\
   rano diff --old abc123 --new def456 --threshold 25 --json\n"
+    );
+}
+
+fn print_status_help() {
+    println!(
+        "rano status - one-line status for shell prompt integration\n\n\
+USAGE:\n  rano status [options]\n\n\
+OPTIONS:\n\
+  --one-line        Output compact format for prompt embedding (default)\n\
+  --format <tpl>    Custom format template string\n\
+  --sqlite <path>   SQLite database path (default: observer.sqlite)\n\
+  -h, --help        Show this help\n\
+  -V, --version     Show version\n\n\
+TEMPLATE VARIABLES:\n\
+  {{active}}        Current active connection count\n\
+  {{total}}         Total connections this session\n\
+  {{anthropic}}     Anthropic provider connection count\n\
+  {{openai}}        OpenAI provider connection count\n\
+  {{google}}        Google provider connection count\n\
+  {{session_name}}  Current session name (if available)\n\n\
+DEFAULT FORMAT:\n\
+  {}\n\n\
+EXAMPLES:\n\
+  rano status                              # Default one-line format\n\
+  rano status --format '{{active}}/{{total}}'    # Custom format\n\
+  rano status --sqlite /tmp/rano.sqlite    # Custom database\n\n\
+SHELL INTEGRATION:\n\
+  # Bash PS1:\n\
+  PS1='$(rano status 2>/dev/null) \\$ '\n\
+  # Starship/Zsh:\n\
+  RPROMPT='$(rano status 2>/dev/null)'\n",
+        STATUS_DEFAULT_FORMAT
     );
 }
 
@@ -6021,6 +6167,167 @@ fn escape_json(s: &str) -> String {
 }
 
 // ============================================================================
+// Status Subcommand (shell prompt integration)
+// ============================================================================
+
+/// Status data retrieved from SQLite for template expansion.
+struct StatusData {
+    active: i64,
+    total: i64,
+    anthropic: i64,
+    openai: i64,
+    google: i64,
+    session_name: Option<String>,
+}
+
+impl Default for StatusData {
+    fn default() -> Self {
+        Self {
+            active: 0,
+            total: 0,
+            anthropic: 0,
+            openai: 0,
+            google: 0,
+            session_name: None,
+        }
+    }
+}
+
+fn run_status(args: StatusArgs) -> Result<(), String> {
+    let path = Path::new(&args.sqlite_path);
+
+    // If no database exists yet, output zeros quietly
+    if !path.exists() {
+        let data = StatusData::default();
+        let format = args.format.as_deref().unwrap_or(STATUS_DEFAULT_FORMAT);
+        let output = expand_status_template(format, &data);
+        println!("{}", output);
+        return Ok(());
+    }
+
+    let conn = Connection::open(path)
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+
+    // Check if events table exists
+    let has_events = table_exists(&conn, "events")?;
+    if !has_events {
+        let data = StatusData::default();
+        let format = args.format.as_deref().unwrap_or(STATUS_DEFAULT_FORMAT);
+        let output = expand_status_template(format, &data);
+        println!("{}", output);
+        return Ok(());
+    }
+
+    // Get the latest session's data
+    let data = get_status_data(&conn)?;
+
+    // Expand template and output
+    let format = args.format.as_deref().unwrap_or(STATUS_DEFAULT_FORMAT);
+    let output = expand_status_template(format, &data);
+    println!("{}", output);
+
+    Ok(())
+}
+
+/// Query SQLite for the latest session's status data.
+fn get_status_data(conn: &Connection) -> Result<StatusData, String> {
+    let mut data = StatusData::default();
+
+    // Get the latest run_id
+    let latest_run_id: Option<String> = conn
+        .query_row(
+            "SELECT run_id FROM events ORDER BY ts DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let run_id = match latest_run_id {
+        Some(id) => id,
+        None => return Ok(data), // No events yet
+    };
+
+    // Get total connections for this session (count of connect events)
+    let total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE run_id = ? AND event = 'connect'",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    data.total = total;
+
+    // Get active connections (connects - closes for this session)
+    let connects: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE run_id = ? AND event = 'connect'",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let closes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE run_id = ? AND event = 'close'",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    data.active = (connects - closes).max(0);
+
+    // Get per-provider counts (connect events only)
+    let provider_sql = "SELECT COALESCE(provider, 'unknown'), COUNT(*) FROM events \
+                        WHERE run_id = ? AND event = 'connect' GROUP BY provider";
+    if let Ok(mut stmt) = conn.prepare(provider_sql) {
+        if let Ok(rows) = stmt.query_map([&run_id], |row| {
+            let provider: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((provider, count))
+        }) {
+            for row in rows.flatten() {
+                let (provider, count) = row;
+                match provider.to_lowercase().as_str() {
+                    "anthropic" => data.anthropic = count,
+                    "openai" => data.openai = count,
+                    "google" => data.google = count,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Try to get session name from sessions table (if it exists)
+    if table_exists(conn, "sessions").unwrap_or(false) {
+        if let Ok(name) = conn.query_row(
+            "SELECT session_name FROM sessions WHERE run_id = ?",
+            [&run_id],
+            |row| row.get::<_, Option<String>>(0),
+        ) {
+            data.session_name = name;
+        }
+    }
+
+    Ok(data)
+}
+
+/// Expand a status template string with data values.
+/// Template variables: {active}, {total}, {anthropic}, {openai}, {google}, {session_name}
+fn expand_status_template(template: &str, data: &StatusData) -> String {
+    let mut result = template.to_string();
+
+    result = result.replace("{active}", &data.active.to_string());
+    result = result.replace("{total}", &data.total.to_string());
+    result = result.replace("{anthropic}", &data.anthropic.to_string());
+    result = result.replace("{openai}", &data.openai.to_string());
+    result = result.replace("{google}", &data.google.to_string());
+    result = result.replace(
+        "{session_name}",
+        data.session_name.as_deref().unwrap_or(""),
+    );
+
+    result
+}
+
+// ============================================================================
 // Report Subcommand
 // ============================================================================
 
@@ -7067,7 +7374,8 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
             interval_ms INTEGER,
             stats_interval_ms INTEGER,
             connects INTEGER,
-            closes INTEGER
+            closes INTEGER,
+            session_name TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
         CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);
@@ -7127,8 +7435,8 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
 
 fn insert_session(conn: &mut Connection, ctx: &RunContext) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO sessions (run_id, start_ts, host, user, patterns, domain_mode, args, interval_ms, stats_interval_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT OR REPLACE INTO sessions (run_id, start_ts, host, user, patterns, domain_mode, args, interval_ms, stats_interval_ms, session_name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             &ctx.run_id,
             &ctx.start_ts,
@@ -7139,6 +7447,7 @@ fn insert_session(conn: &mut Connection, ctx: &RunContext) -> rusqlite::Result<(
             &ctx.args_snapshot,
             ctx.interval_ms as i64,
             ctx.stats_interval_ms as i64,
+            &ctx.session_name,
         ],
     )?;
     Ok(())
@@ -7335,24 +7644,6 @@ fn push_json_map_provider(out: &mut String, key: &str, map: &BTreeMap<Provider, 
         out.push_str(&v.to_string());
     }
     out.push('}');
-}
-
-fn escape_json(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() + 2);
-    for ch in input.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -8880,5 +9171,382 @@ mod tests {
         assert_eq!(AnsiColor::Green.code(), "32");
         assert_eq!(AnsiColor::BrightCyan.code(), "96");
         assert_eq!(AnsiColor::BrightBlack.code(), "90");
+    }
+
+    // Colorblind theme tests
+
+    #[test]
+    fn test_colorblind_theme_provider_symbols() {
+        let style = OutputStyle {
+            color: true,
+            theme: Theme::Colorblind,
+        };
+        // Each provider should have a distinct symbol
+        assert_eq!(style.provider_symbol(Provider::Anthropic), "●"); // Filled circle
+        assert_eq!(style.provider_symbol(Provider::OpenAI), "◆");    // Diamond
+        assert_eq!(style.provider_symbol(Provider::Google), "▲");    // Triangle
+        assert_eq!(style.provider_symbol(Provider::Unknown), "○");   // Empty circle
+    }
+
+    #[test]
+    fn test_colorblind_theme_bar_chars() {
+        let style_colorblind = OutputStyle {
+            color: true,
+            theme: Theme::Colorblind,
+        };
+        let style_vivid = OutputStyle {
+            color: true,
+            theme: Theme::Vivid,
+        };
+
+        // Colorblind theme uses different fill chars per provider
+        assert_eq!(style_colorblind.provider_bar_char(Provider::Anthropic), '█');
+        assert_eq!(style_colorblind.provider_bar_char(Provider::OpenAI), '▓');
+        assert_eq!(style_colorblind.provider_bar_char(Provider::Google), '▒');
+        assert_eq!(style_colorblind.provider_bar_char(Provider::Unknown), '░');
+
+        // Vivid theme uses same char for all providers
+        assert_eq!(style_vivid.provider_bar_char(Provider::Anthropic), '█');
+        assert_eq!(style_vivid.provider_bar_char(Provider::OpenAI), '█');
+        assert_eq!(style_vivid.provider_bar_char(Provider::Google), '█');
+        assert_eq!(style_vivid.provider_bar_char(Provider::Unknown), '█');
+    }
+
+    #[test]
+    fn test_colorblind_theme_high_contrast_colors() {
+        let style = OutputStyle {
+            color: true,
+            theme: Theme::Colorblind,
+        };
+
+        // Colorblind theme uses high-contrast colors (blue/yellow/white/gray)
+        assert_eq!(
+            style.provider_color(Provider::Anthropic),
+            Some(AnsiColor::BrightBlue)
+        );
+        assert_eq!(
+            style.provider_color(Provider::OpenAI),
+            Some(AnsiColor::Yellow)
+        );
+        assert_eq!(
+            style.provider_color(Provider::Google),
+            Some(AnsiColor::White)
+        );
+        assert_eq!(
+            style.provider_color(Provider::Unknown),
+            Some(AnsiColor::BrightBlack)
+        );
+    }
+
+    #[test]
+    fn test_vivid_theme_provider_colors() {
+        let style = OutputStyle {
+            color: true,
+            theme: Theme::Vivid,
+        };
+
+        // Vivid theme uses distinct saturated colors
+        assert_eq!(
+            style.provider_color(Provider::Anthropic),
+            Some(AnsiColor::Magenta)
+        );
+        assert_eq!(
+            style.provider_color(Provider::OpenAI),
+            Some(AnsiColor::BrightGreen)
+        );
+        assert_eq!(
+            style.provider_color(Provider::Google),
+            Some(AnsiColor::BrightBlue)
+        );
+        assert_eq!(
+            style.provider_color(Provider::Unknown),
+            Some(AnsiColor::BrightBlack)
+        );
+    }
+
+    #[test]
+    fn test_mono_theme_no_colors() {
+        let style = OutputStyle {
+            color: true,
+            theme: Theme::Mono,
+        };
+
+        // Mono theme returns None for all providers
+        assert_eq!(style.provider_color(Provider::Anthropic), None);
+        assert_eq!(style.provider_color(Provider::OpenAI), None);
+        assert_eq!(style.provider_color(Provider::Google), None);
+        assert_eq!(style.provider_color(Provider::Unknown), None);
+    }
+
+    #[test]
+    fn test_parse_theme_colorblind() {
+        assert!(matches!(parse_theme("colorblind"), Ok(Theme::Colorblind)));
+        assert!(matches!(parse_theme("COLORBLIND"), Ok(Theme::Colorblind)));
+        assert!(matches!(parse_theme("Colorblind"), Ok(Theme::Colorblind)));
+    }
+
+    #[test]
+    fn test_parse_theme_all_values() {
+        assert!(matches!(parse_theme("vivid"), Ok(Theme::Vivid)));
+        assert!(matches!(parse_theme("mono"), Ok(Theme::Mono)));
+        assert!(matches!(parse_theme("colorblind"), Ok(Theme::Colorblind)));
+        assert!(parse_theme("invalid").is_err());
+    }
+
+    // Session diff tests
+
+    #[test]
+    fn test_diff_result_empty() {
+        let result = DiffResult {
+            new_domains: vec![],
+            removed_domains: vec![],
+            changed_domains: vec![],
+            new_processes: vec![],
+            removed_processes: vec![],
+            provider_changes: HashMap::new(),
+            old_run_id: "old-123".to_string(),
+            new_run_id: "new-456".to_string(),
+        };
+
+        assert!(result.new_domains.is_empty());
+        assert!(result.removed_domains.is_empty());
+        assert!(result.changed_domains.is_empty());
+        assert!(result.new_processes.is_empty());
+        assert!(result.removed_processes.is_empty());
+        assert!(result.provider_changes.is_empty());
+    }
+
+    #[test]
+    fn test_diff_result_with_changes() {
+        let mut provider_changes = HashMap::new();
+        provider_changes.insert("anthropic".to_string(), (10, 20));
+        provider_changes.insert("openai".to_string(), (5, 3));
+
+        let result = DiffResult {
+            new_domains: vec!["new.example.com".to_string()],
+            removed_domains: vec!["old.example.com".to_string()],
+            changed_domains: vec![("api.anthropic.com".to_string(), 100, 150)],
+            new_processes: vec!["new-process".to_string()],
+            removed_processes: vec!["old-process".to_string()],
+            provider_changes,
+            old_run_id: "session-a".to_string(),
+            new_run_id: "session-b".to_string(),
+        };
+
+        assert_eq!(result.new_domains.len(), 1);
+        assert_eq!(result.removed_domains.len(), 1);
+        assert_eq!(result.changed_domains.len(), 1);
+        assert_eq!(result.new_processes.len(), 1);
+        assert_eq!(result.removed_processes.len(), 1);
+        assert_eq!(result.provider_changes.len(), 2);
+
+        // Verify provider changes
+        assert_eq!(result.provider_changes.get("anthropic"), Some(&(10, 20)));
+        assert_eq!(result.provider_changes.get("openai"), Some(&(5, 3)));
+
+        // Verify changed domain tuple
+        let (domain, old, new) = &result.changed_domains[0];
+        assert_eq!(domain, "api.anthropic.com");
+        assert_eq!(*old, 100);
+        assert_eq!(*new, 150);
+    }
+
+    #[test]
+    fn test_diff_result_run_ids() {
+        let result = DiffResult {
+            new_domains: vec![],
+            removed_domains: vec![],
+            changed_domains: vec![],
+            new_processes: vec![],
+            removed_processes: vec![],
+            provider_changes: HashMap::new(),
+            old_run_id: "1234-1705512345000".to_string(),
+            new_run_id: "5678-1705598745000".to_string(),
+        };
+
+        assert_eq!(result.old_run_id, "1234-1705512345000");
+        assert_eq!(result.new_run_id, "5678-1705598745000");
+    }
+
+    #[test]
+    fn test_diff_args_default() {
+        let args = DiffArgs::default();
+        assert!(args.old_id.is_empty());
+        assert!(args.new_id.is_empty());
+        assert_eq!(args.sqlite_path, "observer.sqlite");
+        assert!((args.threshold_pct - 50.0).abs() < f64::EPSILON);
+        assert!(!args.json);
+        assert_eq!(args.color, ColorMode::Auto);
+    }
+
+    // Session name generation tests
+
+    #[test]
+    fn test_generate_session_name_format() {
+        let patterns = vec!["claude".to_string()];
+        let name = generate_session_name(&patterns, Provider::Anthropic);
+
+        // Should be in format: {time}-{provider}-{pattern}-{date}
+        let parts: Vec<&str> = name.split('-').collect();
+        assert!(parts.len() >= 4, "Expected at least 4 parts separated by '-', got: {}", name);
+
+        // First part should be time of day
+        let time_parts = ["night", "morning", "afternoon", "evening"];
+        assert!(time_parts.contains(&parts[0]),
+            "Expected time of day (night/morning/afternoon/evening), got: {}", parts[0]);
+    }
+
+    #[test]
+    fn test_generate_session_name_provider_labels() {
+        let patterns = vec!["test".to_string()];
+
+        let name_anthropic = generate_session_name(&patterns, Provider::Anthropic);
+        assert!(name_anthropic.contains("-anthropic-"), "Anthropic should have 'anthropic' label");
+
+        let name_openai = generate_session_name(&patterns, Provider::OpenAI);
+        assert!(name_openai.contains("-openai-"), "OpenAI should have 'openai' label");
+
+        let name_google = generate_session_name(&patterns, Provider::Google);
+        assert!(name_google.contains("-google-"), "Google should have 'google' label");
+
+        let name_unknown = generate_session_name(&patterns, Provider::Unknown);
+        assert!(name_unknown.contains("-mixed-"), "Unknown should have 'mixed' label");
+    }
+
+    #[test]
+    fn test_generate_session_name_pattern() {
+        let patterns = vec!["MyApp".to_string()];
+        let name = generate_session_name(&patterns, Provider::Anthropic);
+        // Pattern should be lowercase
+        assert!(name.contains("-myapp-"), "Pattern should be lowercased");
+    }
+
+    #[test]
+    fn test_generate_session_name_default_pattern() {
+        let patterns: Vec<String> = vec![];
+        let name = generate_session_name(&patterns, Provider::Anthropic);
+        assert!(name.contains("-default-"), "Empty patterns should use 'default'");
+    }
+
+    #[test]
+    fn test_generate_session_name_date_format() {
+        let patterns = vec!["test".to_string()];
+        let name = generate_session_name(&patterns, Provider::Anthropic);
+
+        // Last part should be YYYY-MM-DD date format
+        let parts: Vec<&str> = name.split('-').collect();
+        let year_part = parts[parts.len() - 3];
+        let month_part = parts[parts.len() - 2];
+        let day_part = parts[parts.len() - 1];
+
+        // Year should be 4 digits
+        assert_eq!(year_part.len(), 4, "Year should be 4 digits");
+        assert!(year_part.chars().all(|c| c.is_ascii_digit()), "Year should be all digits");
+
+        // Month should be 2 digits
+        assert_eq!(month_part.len(), 2, "Month should be 2 digits");
+        let month: u32 = month_part.parse().expect("Month should be numeric");
+        assert!((1..=12).contains(&month), "Month should be 1-12");
+
+        // Day should be 2 digits
+        assert_eq!(day_part.len(), 2, "Day should be 2 digits");
+        let day: u32 = day_part.parse().expect("Day should be numeric");
+        assert!((1..=31).contains(&day), "Day should be 1-31");
+    }
+
+    // Status template expansion tests
+
+    #[test]
+    fn test_expand_status_template_basic() {
+        let data = StatusData {
+            active: 5,
+            total: 100,
+            anthropic: 50,
+            openai: 30,
+            google: 20,
+            session_name: Some("morning-anthropic-claude-2026-01-21".to_string()),
+        };
+
+        let output = expand_status_template("{active} active | total:{total}", &data);
+        assert_eq!(output, "5 active | total:100");
+    }
+
+    #[test]
+    fn test_expand_status_template_providers() {
+        let data = StatusData {
+            active: 10,
+            total: 50,
+            anthropic: 25,
+            openai: 15,
+            google: 10,
+            session_name: None,
+        };
+
+        let output = expand_status_template("A:{anthropic} O:{openai} G:{google}", &data);
+        assert_eq!(output, "A:25 O:15 G:10");
+    }
+
+    #[test]
+    fn test_expand_status_template_session_name() {
+        let data = StatusData {
+            active: 0,
+            total: 0,
+            anthropic: 0,
+            openai: 0,
+            google: 0,
+            session_name: Some("my-session".to_string()),
+        };
+
+        let output = expand_status_template("session: {session_name}", &data);
+        assert_eq!(output, "session: my-session");
+    }
+
+    #[test]
+    fn test_expand_status_template_session_name_none() {
+        let data = StatusData {
+            active: 0,
+            total: 0,
+            anthropic: 0,
+            openai: 0,
+            google: 0,
+            session_name: None,
+        };
+
+        let output = expand_status_template("session: {session_name}", &data);
+        assert_eq!(output, "session: ");
+    }
+
+    #[test]
+    fn test_expand_status_template_default_format() {
+        let data = StatusData {
+            active: 3,
+            total: 10,
+            anthropic: 5,
+            openai: 3,
+            google: 2,
+            session_name: None,
+        };
+
+        let output = expand_status_template(STATUS_DEFAULT_FORMAT, &data);
+        assert_eq!(output, "3 active | anthropic:5 openai:3");
+    }
+
+    #[test]
+    fn test_status_data_default() {
+        let data = StatusData::default();
+        assert_eq!(data.active, 0);
+        assert_eq!(data.total, 0);
+        assert_eq!(data.anthropic, 0);
+        assert_eq!(data.openai, 0);
+        assert_eq!(data.google, 0);
+        assert!(data.session_name.is_none());
+    }
+
+    #[test]
+    fn test_status_args_default() {
+        let args = StatusArgs::default();
+        assert!(!args.one_line);
+        assert!(args.format.is_none());
+        assert_eq!(args.sqlite_path, "observer.sqlite");
     }
 }
