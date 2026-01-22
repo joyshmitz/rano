@@ -57,7 +57,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
 pub const VALID_DOMAIN_MODES: &[&str] = &["auto", "ptr", "pcap"];
 pub const VALID_LOG_FORMATS: &[&str] = &["auto", "pretty", "json"];
 pub const VALID_COLOR_MODES: &[&str] = &["auto", "always", "never"];
-pub const VALID_THEMES: &[&str] = &["vivid", "mono"];
+pub const VALID_THEMES: &[&str] = &["vivid", "mono", "colorblind"];
 pub const VALID_STATS_VIEWS: &[&str] = &["provider", "domain", "port", "process"];
 pub const VALID_PROVIDER_MODES: &[&str] = &["merge", "replace"];
 

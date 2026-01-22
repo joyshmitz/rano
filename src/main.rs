@@ -50,6 +50,7 @@ enum LogFormat {
 enum Theme {
     Vivid,
     Mono,
+    Colorblind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +71,8 @@ enum Command {
     Report(ReportArgs),
     Export(ExportArgs),
     Config(ConfigArgs),
+    Diff(DiffArgs),
+    Status(StatusArgs),
 }
 
 #[derive(Clone, Debug)]
@@ -736,6 +739,81 @@ impl Default for ExportArgs {
     }
 }
 
+/// Arguments for the session diff command.
+#[derive(Clone, Debug)]
+struct DiffArgs {
+    /// Run ID or session name for the older/baseline session
+    old_id: String,
+    /// Run ID or session name for the newer session
+    new_id: String,
+    /// SQLite database path
+    sqlite_path: String,
+    /// Threshold percentage for "significant" count changes
+    threshold_pct: f64,
+    /// Output in JSON format
+    json: bool,
+    /// Color mode
+    color: ColorMode,
+}
+
+impl Default for DiffArgs {
+    fn default() -> Self {
+        Self {
+            old_id: String::new(),
+            new_id: String::new(),
+            sqlite_path: "observer.sqlite".to_string(),
+            threshold_pct: 50.0,
+            json: false,
+            color: ColorMode::Auto,
+        }
+    }
+}
+
+/// Arguments for the status command (shell prompt integration).
+#[derive(Clone, Debug)]
+struct StatusArgs {
+    /// Output in single-line format for prompt embedding
+    one_line: bool,
+    /// Custom format template
+    format: Option<String>,
+    /// SQLite database path
+    sqlite_path: String,
+}
+
+impl Default for StatusArgs {
+    fn default() -> Self {
+        Self {
+            one_line: false,
+            format: None,
+            sqlite_path: "observer.sqlite".to_string(),
+        }
+    }
+}
+
+/// Default format for status output
+const STATUS_DEFAULT_FORMAT: &str = "{active} active | anthropic:{anthropic} openai:{openai}";
+
+/// Result of comparing two sessions.
+#[derive(Clone, Debug)]
+struct DiffResult {
+    /// Domains present in new session but not in old
+    new_domains: Vec<String>,
+    /// Domains present in old session but not in new
+    removed_domains: Vec<String>,
+    /// Domains with count change exceeding threshold: (domain, old_count, new_count)
+    changed_domains: Vec<(String, i64, i64)>,
+    /// Process names that appeared in new session
+    new_processes: Vec<String>,
+    /// Process names that were removed from old session
+    removed_processes: Vec<String>,
+    /// Provider count changes: provider -> (old_count, new_count)
+    provider_changes: HashMap<String, (i64, i64)>,
+    /// Old session run_id
+    old_run_id: String,
+    /// New session run_id
+    new_run_id: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 enum Proto {
     Tcp,
@@ -941,12 +1019,46 @@ impl OutputStyle {
         if !self.color || self.theme == Theme::Mono {
             return None;
         }
+        // Colorblind theme uses high-contrast, distinguishable colors:
+        // Blue/Orange/White are typically safe for most color vision deficiencies
+        if self.theme == Theme::Colorblind {
+            return Some(match provider {
+                Provider::Anthropic => AnsiColor::BrightBlue,   // Bright blue
+                Provider::OpenAI => AnsiColor::Yellow,          // Orange-ish (yellow in ANSI)
+                Provider::Google => AnsiColor::White,           // White/light gray
+                Provider::Unknown => AnsiColor::BrightBlack,    // Dark gray
+            });
+        }
         Some(match provider {
             Provider::Anthropic => AnsiColor::Magenta,
             Provider::OpenAI => AnsiColor::BrightGreen,
             Provider::Google => AnsiColor::BrightBlue,
             Provider::Unknown => AnsiColor::BrightBlack,
         })
+    }
+
+    /// Returns a distinctive symbol for each provider (used in colorblind theme)
+    fn provider_symbol(self, provider: Provider) -> &'static str {
+        match provider {
+            Provider::Anthropic => "●",  // Filled circle
+            Provider::OpenAI => "◆",     // Diamond
+            Provider::Google => "▲",     // Triangle
+            Provider::Unknown => "○",    // Empty circle
+        }
+    }
+
+    /// Returns the bar fill character for a provider (used in colorblind theme)
+    fn provider_bar_char(self, provider: Provider) -> char {
+        if self.theme == Theme::Colorblind {
+            match provider {
+                Provider::Anthropic => '█',  // Solid
+                Provider::OpenAI => '▓',     // Dense shade
+                Provider::Google => '▒',     // Medium shade
+                Provider::Unknown => '░',    // Light shade
+            }
+        } else {
+            '█'
+        }
     }
 
     fn event_color(self, event: &str) -> Option<AnsiColor> {
@@ -1212,6 +1324,13 @@ fn main() {
             Command::Config(config_args) => {
                 let exit_code = run_config(config_args);
                 std::process::exit(exit_code);
+            }
+            Command::Diff(diff_args) => {
+                if let Err(err) = run_diff(diff_args) {
+                    eprintln!("error: {}", err);
+                    std::process::exit(1);
+                }
+                return;
             }
         }
     }
@@ -1712,6 +1831,20 @@ fn parse_cli() -> Result<Cli, String> {
             let config = parse_config_args(&args[2..])?;
             Ok(Cli {
                 command: Some(Command::Config(config)),
+                monitor: MonitorArgs::default(),
+            })
+        }
+        "diff" => {
+            let diff = parse_diff_args(&args[2..])?;
+            Ok(Cli {
+                command: Some(Command::Diff(diff)),
+                monitor: MonitorArgs::default(),
+            })
+        }
+        "status" => {
+            let status = parse_status_args(&args[2..])?;
+            Ok(Cli {
+                command: Some(Command::Status(status)),
                 monitor: MonitorArgs::default(),
             })
         }
@@ -2350,6 +2483,86 @@ fn parse_export_args(argv: &[String]) -> Result<ExportArgs, String> {
     Ok(args)
 }
 
+fn parse_diff_args(argv: &[String]) -> Result<DiffArgs, String> {
+    for arg in argv {
+        if arg == "-h" || arg == "--help" {
+            print_diff_help();
+            std::process::exit(0);
+        }
+        if arg == "-V" || arg == "--version" {
+            print_version();
+            std::process::exit(0);
+        }
+    }
+
+    let mut args = DiffArgs::default();
+    let mut old_set = false;
+    let mut new_set = false;
+
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        match arg.as_str() {
+            "--old" => {
+                i += 1;
+                let value = require_value(argv, i, "--old")?;
+                args.old_id = value.to_string();
+                old_set = true;
+                i += 1;
+            }
+            "--new" => {
+                i += 1;
+                let value = require_value(argv, i, "--new")?;
+                args.new_id = value.to_string();
+                new_set = true;
+                i += 1;
+            }
+            "--sqlite" => {
+                i += 1;
+                let value = require_value(argv, i, "--sqlite")?;
+                args.sqlite_path = value.to_string();
+                i += 1;
+            }
+            "--threshold" => {
+                i += 1;
+                let value = require_value(argv, i, "--threshold")?;
+                args.threshold_pct = value
+                    .parse::<f64>()
+                    .map_err(|_| "Invalid --threshold value".to_string())?;
+                if args.threshold_pct < 0.0 || args.threshold_pct > 100.0 {
+                    return Err("--threshold must be between 0 and 100".to_string());
+                }
+                i += 1;
+            }
+            "--json" => {
+                args.json = true;
+                i += 1;
+            }
+            "--color" => {
+                i += 1;
+                let value = require_value(argv, i, "--color")?;
+                args.color = parse_color_mode(value)?;
+                i += 1;
+            }
+            other => {
+                if other.starts_with('-') {
+                    return Err(format!("Unknown diff flag: {}", other));
+                }
+                return Err(format!("Unexpected diff argument: {}", other));
+            }
+        }
+    }
+
+    if !old_set {
+        return Err("--old <run-id> is required".to_string());
+    }
+    if !new_set {
+        return Err("--new <run-id> is required".to_string());
+    }
+
+    Ok(args)
+}
+
 fn require_value<'a>(argv: &'a [String], index: usize, flag: &str) -> Result<&'a str, String> {
     argv.get(index)
         .map(|v| v.as_str())
@@ -2407,7 +2620,8 @@ fn parse_theme(value: &str) -> Result<Theme, String> {
     match value.to_lowercase().as_str() {
         "vivid" => Ok(Theme::Vivid),
         "mono" => Ok(Theme::Mono),
-        _ => Err("Invalid --theme (use vivid|mono)".to_string()),
+        "colorblind" => Ok(Theme::Colorblind),
+        _ => Err("Invalid --theme (use vivid|mono|colorblind)".to_string()),
     }
 }
 
@@ -2870,7 +3084,7 @@ OPTIONS:\n\
   --once                    Emit a single poll and exit\n\
   --color <mode>            auto|always|never (default: auto)\n\
   --no-color                Disable ANSI color\n\
-  --theme <name>            vivid|mono (default: vivid)\n\
+  --theme <name>            vivid|mono|colorblind (default: vivid)\n\
   --sqlite <path>           SQLite file for persistent logging\n\
   --no-sqlite               Disable SQLite logging\n\
   --db-batch-size <n>       SQLite batch size (events per transaction)\n\
@@ -2980,6 +3194,32 @@ EXAMPLES:\n\
   rano config show                 # Show resolved config\n\
   rano config show --json          # Show config as JSON\n\
   rano config paths                # List config search paths\n"
+    );
+}
+
+fn print_diff_help() {
+    println!(
+        "rano diff - compare two monitoring sessions\n\n\
+USAGE:\n  rano diff --old <id> --new <id> [options]\n\n\
+OPTIONS:\n\
+  --old <id>        Run ID or session name for baseline session (required)\n\
+  --new <id>        Run ID or session name for comparison session (required)\n\
+  --sqlite <path>   SQLite database path (default: observer.sqlite)\n\
+  --threshold <N>   Percentage change threshold for 'significant' (default: 50)\n\
+  --json            Output in JSON format\n\
+  --color <mode>    Color output: auto|always|never (default: auto)\n\
+  -h, --help        Show this help\n\
+  -V, --version     Show version\n\n\
+OUTPUT SECTIONS:\n\
+  New domains       Domains in new session but not in old\n\
+  Removed domains   Domains in old session but not in new\n\
+  Changed domains   Domains with count change exceeding threshold\n\
+  New processes     Process names that appeared in new session\n\
+  Provider changes  Significant count changes per provider\n\n\
+EXAMPLES:\n\
+  rano diff --old abc123 --new def456\n\
+  rano diff --old morning-claude-audit-2026-01-20 --new afternoon-claude-audit-2026-01-20\n\
+  rano diff --old abc123 --new def456 --threshold 25 --json\n"
     );
 }
 
@@ -3958,11 +4198,22 @@ fn print_provider_stats(stats: &Stats, width: usize, style: OutputStyle) {
     for provider in providers {
         let count = *stats.per_provider.get(&provider).unwrap_or(&0);
         let bar_len = ((count as f64 / total as f64) * width as f64).round() as usize;
-        let bar_plain = format!("{:width$}", "█".repeat(bar_len), width = width);
+        let bar_char = style.provider_bar_char(provider);
+        let bar_plain = format!(
+            "{:width$}",
+            bar_char.to_string().repeat(bar_len),
+            width = width
+        );
         let bar = if style.color {
             paint(&bar_plain, style.provider_color(provider), false, false, style.color)
         } else {
             bar_plain
+        };
+        // Include symbol prefix for colorblind theme
+        let symbol = if style.theme == Theme::Colorblind {
+            format!("{} ", style.provider_symbol(provider))
+        } else {
+            String::new()
         };
         let label = paint(
             provider.label(),
@@ -3982,8 +4233,8 @@ fn print_provider_stats(stats: &Stats, width: usize, style: OutputStyle) {
             .map(|s| s.len())
             .unwrap_or(0);
         println!(
-            "  {:<10} | {} {} (domains={}, ips={})",
-            label, bar, count, domains, ips
+            "  {}{:<10} | {} {} (domains={}, ips={})",
+            symbol, label, bar, count, domains, ips
         );
     }
     println!(
@@ -5334,6 +5585,439 @@ fn open_export_output(path: &Option<PathBuf>) -> Result<Box<dyn Write>, String> 
     } else {
         Ok(Box::new(BufWriter::new(std::io::stdout())))
     }
+}
+
+// ============================================================================
+// Diff Subcommand
+// ============================================================================
+
+fn run_diff(args: DiffArgs) -> Result<(), String> {
+    let path = Path::new(&args.sqlite_path);
+    if !path.exists() {
+        return Err(format!("SQLite file not found: {}", args.sqlite_path));
+    }
+
+    let conn = Connection::open(path)
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+
+    let has_events = table_exists(&conn, "events")?;
+    if !has_events {
+        return Err(format!(
+            "Database does not contain rano event data (missing events table). {}",
+            schema_hint(&args.sqlite_path)
+        ));
+    }
+
+    // Compute the diff
+    let result = compute_session_diff(&conn, &args.old_id, &args.new_id, args.threshold_pct)?;
+
+    // Output
+    let color_enabled = resolve_color_mode(args.color);
+    if args.json {
+        output_diff_json(&result)?;
+    } else {
+        output_diff_pretty(&result, color_enabled)?;
+    }
+
+    Ok(())
+}
+
+/// Compute a diff between two sessions identified by run_id.
+fn compute_session_diff(
+    conn: &Connection,
+    old_id: &str,
+    new_id: &str,
+    threshold_pct: f64,
+) -> Result<DiffResult, String> {
+    // Validate that both sessions exist
+    validate_session_exists(conn, old_id)?;
+    validate_session_exists(conn, new_id)?;
+
+    // Get domain counts for each session
+    let old_domains = get_session_domain_counts(conn, old_id)?;
+    let new_domains = get_session_domain_counts(conn, new_id)?;
+
+    // Get process names for each session
+    let old_processes = get_session_processes(conn, old_id)?;
+    let new_processes = get_session_processes(conn, new_id)?;
+
+    // Get provider counts for each session
+    let old_providers = get_session_provider_counts(conn, old_id)?;
+    let new_providers = get_session_provider_counts(conn, new_id)?;
+
+    // Compute domain diffs
+    let old_domain_set: HashSet<&String> = old_domains.keys().collect();
+    let new_domain_set: HashSet<&String> = new_domains.keys().collect();
+
+    let added_domains: Vec<String> = new_domain_set
+        .difference(&old_domain_set)
+        .filter_map(|d| {
+            // Filter out empty/null domains
+            if d.is_empty() || *d == "unknown" {
+                None
+            } else {
+                Some((*d).clone())
+            }
+        })
+        .collect();
+
+    let removed_domains: Vec<String> = old_domain_set
+        .difference(&new_domain_set)
+        .filter_map(|d| {
+            if d.is_empty() || *d == "unknown" {
+                None
+            } else {
+                Some((*d).clone())
+            }
+        })
+        .collect();
+
+    // Find domains with significant count changes
+    let mut changed_domains = Vec::new();
+    for domain in old_domain_set.intersection(&new_domain_set) {
+        let old_count = *old_domains.get(*domain).unwrap_or(&0);
+        let new_count = *new_domains.get(*domain).unwrap_or(&0);
+        if old_count > 0 {
+            let change_pct = ((new_count as f64 - old_count as f64) / old_count as f64).abs() * 100.0;
+            if change_pct >= threshold_pct {
+                changed_domains.push(((*domain).clone(), old_count, new_count));
+            }
+        } else if new_count > 0 {
+            // Old was 0, new is non-zero -> 100% change
+            changed_domains.push(((*domain).clone(), old_count, new_count));
+        }
+    }
+    changed_domains.sort_by(|a, b| {
+        let a_diff = (a.2 - a.1).abs();
+        let b_diff = (b.2 - b.1).abs();
+        b_diff.cmp(&a_diff)
+    });
+
+    // Compute process diffs
+    let added_processes: Vec<String> = new_processes.difference(&old_processes).cloned().collect();
+    let removed_processes: Vec<String> = old_processes.difference(&new_processes).cloned().collect();
+
+    // Compute provider changes
+    let mut provider_changes: HashMap<String, (i64, i64)> = HashMap::new();
+    let all_providers: HashSet<&String> = old_providers.keys().chain(new_providers.keys()).collect();
+    for provider in all_providers {
+        let old_count = *old_providers.get(provider).unwrap_or(&0);
+        let new_count = *new_providers.get(provider).unwrap_or(&0);
+        if old_count != new_count {
+            provider_changes.insert(provider.clone(), (old_count, new_count));
+        }
+    }
+
+    Ok(DiffResult {
+        new_domains: added_domains,
+        removed_domains,
+        changed_domains,
+        new_processes: added_processes,
+        removed_processes,
+        provider_changes,
+        old_run_id: old_id.to_string(),
+        new_run_id: new_id.to_string(),
+    })
+}
+
+fn validate_session_exists(conn: &Connection, run_id: &str) -> Result<(), String> {
+    // Try to find events for this run_id
+    let sql = "SELECT COUNT(*) FROM events WHERE run_id = ?";
+    let count: i64 = conn
+        .query_row(sql, [run_id], |row| row.get(0))
+        .map_err(|e| format!("Failed to query session '{}': {}", run_id, e))?;
+
+    if count == 0 {
+        return Err(format!(
+            "No events found for session '{}'. Use 'rano report --latest' to see available sessions.",
+            run_id
+        ));
+    }
+    Ok(())
+}
+
+fn get_session_domain_counts(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<HashMap<String, i64>, String> {
+    let sql = "SELECT COALESCE(domain, 'unknown'), COUNT(*) FROM events WHERE run_id = ? GROUP BY domain";
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let rows = stmt
+        .query_map([run_id], |row| {
+            let domain: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((domain, count))
+        })
+        .map_err(|e| format!("Failed to query domains: {}", e))?;
+
+    let mut result = HashMap::new();
+    for row in rows {
+        let (domain, count) = row.map_err(|e| format!("Failed to read row: {}", e))?;
+        result.insert(domain, count);
+    }
+    Ok(result)
+}
+
+fn get_session_processes(conn: &Connection, run_id: &str) -> Result<HashSet<String>, String> {
+    let sql = "SELECT DISTINCT COALESCE(comm, 'unknown') FROM events WHERE run_id = ?";
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let rows = stmt
+        .query_map([run_id], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("Failed to query processes: {}", e))?;
+
+    let mut result = HashSet::new();
+    for row in rows {
+        let comm = row.map_err(|e| format!("Failed to read row: {}", e))?;
+        if !comm.is_empty() && comm != "unknown" {
+            result.insert(comm);
+        }
+    }
+    Ok(result)
+}
+
+fn get_session_provider_counts(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<HashMap<String, i64>, String> {
+    let sql = "SELECT COALESCE(provider, 'unknown'), COUNT(*) FROM events WHERE run_id = ? GROUP BY provider";
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let rows = stmt
+        .query_map([run_id], |row| {
+            let provider: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((provider, count))
+        })
+        .map_err(|e| format!("Failed to query providers: {}", e))?;
+
+    let mut result = HashMap::new();
+    for row in rows {
+        let (provider, count) = row.map_err(|e| format!("Failed to read row: {}", e))?;
+        result.insert(provider, count);
+    }
+    Ok(result)
+}
+
+fn output_diff_pretty(result: &DiffResult, color_enabled: bool) -> Result<(), String> {
+    let green = if color_enabled { "\x1b[32m" } else { "" };
+    let red = if color_enabled { "\x1b[31m" } else { "" };
+    let yellow = if color_enabled { "\x1b[33m" } else { "" };
+    let cyan = if color_enabled { "\x1b[36m" } else { "" };
+    let bold = if color_enabled { "\x1b[1m" } else { "" };
+    let reset = if color_enabled { "\x1b[0m" } else { "" };
+
+    println!(
+        "{}Session Diff{}\n  old: {}\n  new: {}\n",
+        bold, reset, result.old_run_id, result.new_run_id
+    );
+
+    // Provider changes
+    if !result.provider_changes.is_empty() {
+        println!("{}Provider Changes:{}", cyan, reset);
+        let mut sorted_providers: Vec<_> = result.provider_changes.iter().collect();
+        sorted_providers.sort_by(|a, b| a.0.cmp(b.0));
+        for (provider, (old, new)) in sorted_providers {
+            let diff = new - old;
+            let sign = if diff > 0 { "+" } else { "" };
+            let color = if diff > 0 { green } else { red };
+            println!(
+                "  {}: {} → {} ({}{}{}{})",
+                provider, old, new, color, sign, diff, reset
+            );
+        }
+        println!();
+    }
+
+    // New domains
+    if !result.new_domains.is_empty() {
+        println!("{}New Domains:{} ({} added)", green, reset, result.new_domains.len());
+        for domain in &result.new_domains {
+            println!("  {}+{} {}", green, reset, domain);
+        }
+        println!();
+    }
+
+    // Removed domains
+    if !result.removed_domains.is_empty() {
+        println!(
+            "{}Removed Domains:{} ({} removed)",
+            red,
+            reset,
+            result.removed_domains.len()
+        );
+        for domain in &result.removed_domains {
+            println!("  {}-{} {}", red, reset, domain);
+        }
+        println!();
+    }
+
+    // Changed domains (significant count changes)
+    if !result.changed_domains.is_empty() {
+        println!("{}Changed Domains:{} (count changes)", yellow, reset);
+        for (domain, old, new) in &result.changed_domains {
+            let diff = new - old;
+            let sign = if diff > 0 { "+" } else { "" };
+            let color = if diff > 0 { green } else { red };
+            println!(
+                "  {}: {} → {} ({}{}{}{})",
+                domain, old, new, color, sign, diff, reset
+            );
+        }
+        println!();
+    }
+
+    // New processes
+    if !result.new_processes.is_empty() {
+        println!(
+            "{}New Processes:{} ({} appeared)",
+            green,
+            reset,
+            result.new_processes.len()
+        );
+        for proc in &result.new_processes {
+            println!("  {}+{} {}", green, reset, proc);
+        }
+        println!();
+    }
+
+    // Removed processes
+    if !result.removed_processes.is_empty() {
+        println!(
+            "{}Removed Processes:{} ({} disappeared)",
+            red,
+            reset,
+            result.removed_processes.len()
+        );
+        for proc in &result.removed_processes {
+            println!("  {}-{} {}", red, reset, proc);
+        }
+        println!();
+    }
+
+    // Summary
+    let has_changes = !result.new_domains.is_empty()
+        || !result.removed_domains.is_empty()
+        || !result.changed_domains.is_empty()
+        || !result.new_processes.is_empty()
+        || !result.removed_processes.is_empty()
+        || !result.provider_changes.is_empty();
+
+    if !has_changes {
+        println!("{}No significant differences found.{}", cyan, reset);
+    }
+
+    Ok(())
+}
+
+fn output_diff_json(result: &DiffResult) -> Result<(), String> {
+    // Manually construct JSON to avoid adding serde_json dependency
+    let mut json = String::from("{\n");
+
+    json.push_str(&format!("  \"old_run_id\": \"{}\",\n", escape_json(&result.old_run_id)));
+    json.push_str(&format!("  \"new_run_id\": \"{}\",\n", escape_json(&result.new_run_id)));
+
+    // new_domains array
+    json.push_str("  \"new_domains\": [");
+    for (i, domain) in result.new_domains.iter().enumerate() {
+        if i > 0 {
+            json.push_str(", ");
+        }
+        json.push_str(&format!("\"{}\"", escape_json(domain)));
+    }
+    json.push_str("],\n");
+
+    // removed_domains array
+    json.push_str("  \"removed_domains\": [");
+    for (i, domain) in result.removed_domains.iter().enumerate() {
+        if i > 0 {
+            json.push_str(", ");
+        }
+        json.push_str(&format!("\"{}\"", escape_json(domain)));
+    }
+    json.push_str("],\n");
+
+    // changed_domains array of objects
+    json.push_str("  \"changed_domains\": [");
+    for (i, (domain, old, new)) in result.changed_domains.iter().enumerate() {
+        if i > 0 {
+            json.push_str(", ");
+        }
+        json.push_str(&format!(
+            "{{\"domain\": \"{}\", \"old_count\": {}, \"new_count\": {}}}",
+            escape_json(domain),
+            old,
+            new
+        ));
+    }
+    json.push_str("],\n");
+
+    // new_processes array
+    json.push_str("  \"new_processes\": [");
+    for (i, proc) in result.new_processes.iter().enumerate() {
+        if i > 0 {
+            json.push_str(", ");
+        }
+        json.push_str(&format!("\"{}\"", escape_json(proc)));
+    }
+    json.push_str("],\n");
+
+    // removed_processes array
+    json.push_str("  \"removed_processes\": [");
+    for (i, proc) in result.removed_processes.iter().enumerate() {
+        if i > 0 {
+            json.push_str(", ");
+        }
+        json.push_str(&format!("\"{}\"", escape_json(proc)));
+    }
+    json.push_str("],\n");
+
+    // provider_changes object
+    json.push_str("  \"provider_changes\": {");
+    let mut sorted_providers: Vec<_> = result.provider_changes.iter().collect();
+    sorted_providers.sort_by(|a, b| a.0.cmp(b.0));
+    for (i, (provider, (old, new))) in sorted_providers.iter().enumerate() {
+        if i > 0 {
+            json.push_str(", ");
+        }
+        json.push_str(&format!(
+            "\"{}\": {{\"old_count\": {}, \"new_count\": {}}}",
+            escape_json(provider),
+            old,
+            new
+        ));
+    }
+    json.push_str("}\n");
+
+    json.push_str("}\n");
+
+    print!("{}", json);
+    Ok(())
+}
+
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ============================================================================
