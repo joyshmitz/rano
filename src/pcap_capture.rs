@@ -428,17 +428,74 @@ fn parse_ipv6_packet(data: &[u8], offset: usize) -> Option<TransportPacket<'_>> 
     if data.len() < offset + 40 {
         return None;
     }
-    let next_header = data[offset + 6];
+    let mut next_header = data[offset + 6];
     let src_bytes: [u8; 16] = data[offset + 8..offset + 24].try_into().ok()?;
     let src_ip = IpAddr::V6(Ipv6Addr::from(src_bytes));
     let dst_bytes: [u8; 16] = data[offset + 24..offset + 40].try_into().ok()?;
     let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_bytes));
-    let l4_offset = offset + 40;
-    match next_header {
-        6 => parse_tcp_segment(data, l4_offset, src_ip, dst_ip),
-        17 => parse_udp_datagram(data, l4_offset, src_ip, dst_ip),
-        _ => None,
+    
+    let mut current_offset = offset + 40;
+
+    // Loop to skip extension headers
+    // We limit the number of extensions to avoid infinite loops or DoS
+    for _ in 0..10 {
+        match next_header {
+            6 => return parse_tcp_segment(data, current_offset, src_ip, dst_ip),
+            17 => return parse_udp_datagram(data, current_offset, src_ip, dst_ip),
+            // Hop-by-Hop (0), Routing (43), Destination Options (60)
+            0 | 43 | 60 => {
+                if data.len() < current_offset + 2 {
+                    return None;
+                }
+                next_header = data[current_offset];
+                // Length is in 8-octet units, not including the first 8 octets
+                let hdr_ext_len = data[current_offset + 1];
+                let len_bytes = (hdr_ext_len as usize + 1) * 8;
+                current_offset += len_bytes;
+                if current_offset > data.len() {
+                    return None;
+                }
+            }
+            // Fragment Header (44)
+            44 => {
+                if data.len() < current_offset + 8 {
+                    return None;
+                }
+                next_header = data[current_offset];
+                
+                // Check Fragment Offset to ensure this is the first fragment
+                // Offset is in the high 13 bits of the 16-bit field at offset + 2
+                let field = u16::from_be_bytes([data[current_offset + 2], data[current_offset + 3]]);
+                let frag_offset = field >> 3;
+                
+                if frag_offset != 0 {
+                    // Not the first fragment, so we can't see the L4 header
+                    return None;
+                }
+                
+                // Fragment header is fixed 8 bytes
+                current_offset += 8;
+            }
+            // Authentication Header (51)
+            51 => {
+                if data.len() < current_offset + 2 {
+                    return None;
+                }
+                next_header = data[current_offset];
+                // Payload Len is in 4-byte units, minus 2
+                let payload_len = data[current_offset + 1];
+                let len_bytes = (payload_len as usize + 2) * 4;
+                current_offset += len_bytes;
+                if current_offset > data.len() {
+                    return None;
+                }
+            }
+            // Unknown or unhandled extension (e.g. ESP=50, NoNext=59)
+            _ => return None,
+        }
     }
+    
+    None
 }
 
 #[cfg(feature = "pcap")]
@@ -1428,6 +1485,41 @@ mod tests {
         packet.extend_from_slice(&[0x00, 0x00]); // Urgent pointer
 
         packet
+    }
+
+    #[cfg(feature = "pcap")]
+    #[test]
+    fn transport_parse_ipv6_with_extension_headers() {
+        // Construct IPv6 packet with Hop-by-Hop options -> UDP
+        let mut packet = Vec::new();
+        // Ethernet header
+        packet.extend_from_slice(&[0; 12]);
+        packet.extend_from_slice(&[0x86, 0xDD]); // IPv6
+
+        // IPv6 header
+        packet.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]); // Version, Class, Flow
+        packet.extend_from_slice(&[0x00, 0x10]); // Payload length (16 bytes: 8 ext + 8 UDP)
+        packet.push(0); // Next Header: Hop-by-Hop (0)
+        packet.push(64); // Hop Limit
+        packet.extend_from_slice(&[0; 16]); // Src IP
+        packet.extend_from_slice(&[0; 16]); // Dst IP
+
+        // Hop-by-Hop Options Header
+        packet.push(17); // Next Header: UDP (17)
+        packet.push(0); // Hdr Ext Len: (0 + 1) * 8 = 8 bytes
+        packet.extend_from_slice(&[0; 6]); // Padding
+
+        // UDP Header
+        packet.extend_from_slice(&(1234u16).to_be_bytes()); // Src Port
+        packet.extend_from_slice(&(53u16).to_be_bytes()); // Dst Port
+        packet.extend_from_slice(&[0x00, 0x08]); // Length
+        packet.extend_from_slice(&[0x00, 0x00]); // Checksum
+
+        let result = parse_transport_packet(&packet);
+        assert!(result.is_some(), "Should parse IPv6 with extension header");
+        let tp = result.unwrap();
+        assert!(matches!(tp.proto, TransportProto::Udp));
+        assert_eq!(tp.dst_port, 53);
     }
 
     #[cfg(feature = "pcap")]

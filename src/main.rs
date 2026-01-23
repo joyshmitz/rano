@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, OpenOptions};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -3594,6 +3594,15 @@ fn should_emit_alert(
     cooldown_ms: u64,
 ) -> bool {
     let now = SystemTime::now();
+
+    // Prevent memory leak from stale keys
+    if state.last_alert.len() > 5000 {
+        let window = Duration::from_millis(cooldown_ms);
+        state.last_alert.retain(|_, ts| {
+            now.duration_since(*ts).unwrap_or_default() < window
+        });
+    }
+
     if let Some(last) = state.last_alert.get(sig) {
         if let Ok(elapsed) = now.duration_since(*last) {
             if elapsed.as_millis() < cooldown_ms as u128 {
@@ -5163,14 +5172,21 @@ fn gather_net_entries(include_udp: bool) -> Vec<(Proto, NetEntry)> {
 
 fn read_net_file(path: &str, proto: Proto, ipv6: bool) -> Vec<(Proto, NetEntry)> {
     let mut result = Vec::new();
-    if !Path::new(path).exists() {
-        return result;
-    }
-    let content = fs::read_to_string(path).unwrap_or_default();
-    for (idx, line) in content.lines().enumerate() {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return result,
+    };
+    let reader = BufReader::new(file);
+
+    for (idx, line_result) in reader.lines().enumerate() {
         if idx == 0 {
             continue;
         }
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 10 {
             continue;
