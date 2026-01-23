@@ -146,11 +146,21 @@ impl ValidationResult {
         self.warnings.extend(other.warnings);
     }
 
-    fn add_error(&mut self, file: impl Into<PathBuf>, line: Option<usize>, message: impl Into<String>) {
+    fn add_error(
+        &mut self,
+        file: impl Into<PathBuf>,
+        line: Option<usize>,
+        message: impl Into<String>,
+    ) {
         self.errors.push(ConfigError::new(file, line, message));
     }
 
-    fn add_warning(&mut self, file: impl Into<PathBuf>, line: Option<usize>, message: impl Into<String>) {
+    fn add_warning(
+        &mut self,
+        file: impl Into<PathBuf>,
+        line: Option<usize>,
+        message: impl Into<String>,
+    ) {
         self.warnings.push(ConfigWarning::new(file, line, message));
     }
 }
@@ -196,7 +206,11 @@ pub fn validate_config_file(path: &Path) -> ValidationResult {
 
         // Check for missing value
         if value.is_none() || value.unwrap().is_empty() {
-            result.add_error(path, Some(line_num), format!("missing value for key '{}'", key));
+            result.add_error(
+                path,
+                Some(line_num),
+                format!("missing value for key '{}'", key),
+            );
             continue;
         }
 
@@ -229,14 +243,28 @@ fn validate_config_value(
 ) {
     match key {
         // Boolean values
-        "no_descendants" | "json" | "summary_only" | "pcap" | "no_dns" | "include_udp"
-        | "include_listening" | "show_ancestry" | "once" | "no_sqlite" | "no_banner"
-        | "alert_unknown_domain" | "alert_bell" | "no_alerts" => {
+        "no_descendants"
+        | "json"
+        | "summary_only"
+        | "pcap"
+        | "no_dns"
+        | "include_udp"
+        | "include_listening"
+        | "show_ancestry"
+        | "once"
+        | "no_sqlite"
+        | "no_banner"
+        | "alert_unknown_domain"
+        | "alert_bell"
+        | "no_alerts" => {
             if !is_valid_bool(value) {
                 result.add_error(
                     path,
                     Some(line),
-                    format!("'{}' must be a boolean (true/false/yes/no/1/0), got '{}'", key, value),
+                    format!(
+                        "'{}' must be a boolean (true/false/yes/no/1/0), got '{}'",
+                        key, value
+                    ),
                 );
             }
         }
@@ -247,7 +275,10 @@ fn validate_config_value(
                 result.add_error(
                     path,
                     Some(line),
-                    format!("'{}' must be a valid process ID (positive integer), got '{}'", key, value),
+                    format!(
+                        "'{}' must be a valid process ID (positive integer), got '{}'",
+                        key, value
+                    ),
                 );
             }
         }
@@ -268,11 +299,7 @@ fn validate_config_value(
         "alert_max_connections" | "alert_max_per_provider" | "alert_duration_ms" => {
             match value.parse::<u64>() {
                 Ok(0) => {
-                    result.add_error(
-                        path,
-                        Some(line),
-                        format!("'{}' must be >= 1, got 0", key),
-                    );
+                    result.add_error(path, Some(line), format!("'{}' must be >= 1, got 0", key));
                 }
                 Err(_) => {
                     result.add_error(
@@ -286,25 +313,19 @@ fn validate_config_value(
         }
 
         // Positive usize values that must be >= 1
-        "db_batch_size" | "db_queue_max" => {
-            match value.parse::<usize>() {
-                Ok(0) => {
-                    result.add_error(
-                        path,
-                        Some(line),
-                        format!("'{}' must be >= 1, got 0", key),
-                    );
-                }
-                Err(_) => {
-                    result.add_error(
-                        path,
-                        Some(line),
-                        format!("'{}' must be a positive integer, got '{}'", key, value),
-                    );
-                }
-                Ok(_) => {}
+        "db_batch_size" | "db_queue_max" => match value.parse::<usize>() {
+            Ok(0) => {
+                result.add_error(path, Some(line), format!("'{}' must be >= 1, got 0", key));
             }
-        }
+            Err(_) => {
+                result.add_error(
+                    path,
+                    Some(line),
+                    format!("'{}' must be a positive integer, got '{}'", key, value),
+                );
+            }
+            Ok(_) => {}
+        },
 
         // Non-negative usize values
         "stats_width" | "stats_top" => {
@@ -468,7 +489,10 @@ pub fn validate_toml_config(path: &Path) -> ValidationResult {
             result.add_warning(
                 path,
                 None,
-                format!("unknown top-level key '{}' (only 'providers' is supported)", key),
+                format!(
+                    "unknown top-level key '{}' (only 'providers' is supported)",
+                    key
+                ),
             );
         }
     }
@@ -563,11 +587,7 @@ pub fn validate_paths(
     if let Some(dir) = log_dir {
         if dir.exists() {
             if !dir.is_dir() {
-                result.add_error(
-                    dir,
-                    None,
-                    "log_dir exists but is not a directory",
-                );
+                result.add_error(dir, None, "log_dir exists but is not a directory");
             }
         } else {
             // Check if parent exists (directory can be created)
@@ -576,7 +596,10 @@ pub fn validate_paths(
                     result.add_warning(
                         dir,
                         None,
-                        format!("log_dir parent '{}' does not exist (will be created)", parent.display()),
+                        format!(
+                            "log_dir parent '{}' does not exist (will be created)",
+                            parent.display()
+                        ),
                     );
                 }
             }
@@ -590,7 +613,10 @@ pub fn validate_paths(
                 result.add_error(
                     file,
                     None,
-                    format!("log_file parent directory '{}' does not exist", parent.display()),
+                    format!(
+                        "log_file parent directory '{}' does not exist",
+                        parent.display()
+                    ),
                 );
             }
         }
@@ -603,7 +629,10 @@ pub fn validate_paths(
                 result.add_error(
                     db_path,
                     None,
-                    format!("sqlite parent directory '{}' does not exist", parent.display()),
+                    format!(
+                        "sqlite parent directory '{}' does not exist",
+                        parent.display()
+                    ),
                 );
             }
         }
@@ -753,7 +782,11 @@ no_banner=false
 "#,
         );
         let result = validate_config_file(file.path());
-        assert!(result.is_valid(), "Expected valid, got errors: {:?}", result.errors);
+        assert!(
+            result.is_valid(),
+            "Expected valid, got errors: {:?}",
+            result.errors
+        );
         assert!(result.warnings.is_empty());
     }
 
@@ -817,7 +850,11 @@ openai = ["codex"]
 "#,
         );
         let result = validate_toml_config(file.path());
-        assert!(result.is_valid(), "Expected valid, got errors: {:?}", result.errors);
+        assert!(
+            result.is_valid(),
+            "Expected valid, got errors: {:?}",
+            result.errors
+        );
     }
 
     #[test]
@@ -869,11 +906,7 @@ unknown_provider = ["test"]
 
     #[test]
     fn test_validate_paths_missing_parent() {
-        let result = validate_paths(
-            None,
-            Some(Path::new("/nonexistent/path/logfile.log")),
-            None,
-        );
+        let result = validate_paths(None, Some(Path::new("/nonexistent/path/logfile.log")), None);
         assert!(!result.is_valid());
         assert!(result.errors[0].message.contains("does not exist"));
     }

@@ -10,11 +10,11 @@ use std::env;
 #[cfg(feature = "pcap")]
 use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(feature = "pcap")]
+use std::sync::Arc;
+#[cfg(feature = "pcap")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "pcap")]
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
-#[cfg(feature = "pcap")]
-use std::sync::Arc;
 #[cfg(feature = "pcap")]
 use std::thread::JoinHandle;
 
@@ -166,8 +166,15 @@ fn is_expired(mapping: &DomainMapping, now: SystemTime) -> bool {
 
 #[derive(Debug)]
 pub enum PcapMsg {
-    DnsMapping { ip: IpAddr, hostname: String },
-    SniMapping { ip: IpAddr, port: u16, hostname: String },
+    DnsMapping {
+        ip: IpAddr,
+        hostname: String,
+    },
+    SniMapping {
+        ip: IpAddr,
+        port: u16,
+        hostname: String,
+    },
 }
 
 pub struct PcapHandle {
@@ -279,24 +286,26 @@ pub fn start_pcap_capture() -> Result<PcapHandle, String> {
         .map_err(|e| format!("pcap nonblock failed: {e}"))?;
 
     let stop_thread = stop.clone();
-    let handle = std::thread::spawn(move || loop {
-        if stop_thread.load(Ordering::SeqCst) {
-            break;
-        }
-        match cap.next_packet() {
-            Ok(packet) => {
-                if let Some(tp) = parse_transport_packet(packet.data) {
-                    handle_transport_packet(tp, &sender);
-                }
-            }
-            Err(pcap::Error::TimeoutExpired) => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(pcap::Error::NoMorePackets) => {
+    let handle = std::thread::spawn(move || {
+        loop {
+            if stop_thread.load(Ordering::SeqCst) {
                 break;
             }
-            Err(_) => {
-                std::thread::sleep(Duration::from_millis(50));
+            match cap.next_packet() {
+                Ok(packet) => {
+                    if let Some(tp) = parse_transport_packet(packet.data) {
+                        handle_transport_packet(tp, &sender);
+                    }
+                }
+                Err(pcap::Error::TimeoutExpired) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(pcap::Error::NoMorePackets) => {
+                    break;
+                }
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
         }
     });
@@ -433,7 +442,7 @@ fn parse_ipv6_packet(data: &[u8], offset: usize) -> Option<TransportPacket<'_>> 
     let src_ip = IpAddr::V6(Ipv6Addr::from(src_bytes));
     let dst_bytes: [u8; 16] = data[offset + 24..offset + 40].try_into().ok()?;
     let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_bytes));
-    
+
     let mut current_offset = offset + 40;
 
     // Loop to skip extension headers
@@ -462,17 +471,18 @@ fn parse_ipv6_packet(data: &[u8], offset: usize) -> Option<TransportPacket<'_>> 
                     return None;
                 }
                 next_header = data[current_offset];
-                
+
                 // Check Fragment Offset to ensure this is the first fragment
                 // Offset is in the high 13 bits of the 16-bit field at offset + 2
-                let field = u16::from_be_bytes([data[current_offset + 2], data[current_offset + 3]]);
+                let field =
+                    u16::from_be_bytes([data[current_offset + 2], data[current_offset + 3]]);
                 let frag_offset = field >> 3;
-                
+
                 if frag_offset != 0 {
                     // Not the first fragment, so we can't see the L4 header
                     return None;
                 }
-                
+
                 // Fragment header is fixed 8 bytes
                 current_offset += 8;
             }
@@ -494,7 +504,7 @@ fn parse_ipv6_packet(data: &[u8], offset: usize) -> Option<TransportPacket<'_>> 
             _ => return None,
         }
     }
-    
+
     None
 }
 
@@ -693,9 +703,8 @@ fn parse_tls_sni(payload: &[u8]) -> Option<String> {
     if payload[5] != 0x01 {
         return None;
     }
-    let hs_len = ((payload[6] as usize) << 16)
-        | ((payload[7] as usize) << 8)
-        | (payload[8] as usize);
+    let hs_len =
+        ((payload[6] as usize) << 16) | ((payload[7] as usize) << 8) | (payload[8] as usize);
     if record_len < 4 + hs_len {
         return None;
     }
@@ -827,10 +836,7 @@ mod tests {
         });
 
         // Lookup by exact IP+port should find SNI mapping
-        assert_eq!(
-            cache.lookup(ip, 443),
-            Some("api.anthropic.com".to_string())
-        );
+        assert_eq!(cache.lookup(ip, 443), Some("api.anthropic.com".to_string()));
         // Different port should not find SNI mapping
         assert!(cache.lookup(ip, 80).is_none());
     }
@@ -854,10 +860,7 @@ mod tests {
         });
 
         // SNI should be preferred for exact port match
-        assert_eq!(
-            cache.lookup(ip, 443),
-            Some("api.anthropic.com".to_string())
-        );
+        assert_eq!(cache.lookup(ip, 443), Some("api.anthropic.com".to_string()));
         // DNS should be used for other ports
         assert_eq!(cache.lookup(ip, 80), Some("cloudflare.net".to_string()));
     }
@@ -865,7 +868,9 @@ mod tests {
     #[test]
     fn domain_cache_ipv6_support() {
         let mut cache = DomainCache::new();
-        let ip = IpAddr::V6(Ipv6Addr::new(0x2607, 0xf8b0, 0x4004, 0x800, 0, 0, 0, 0x200e));
+        let ip = IpAddr::V6(Ipv6Addr::new(
+            0x2607, 0xf8b0, 0x4004, 0x800, 0, 0, 0, 0x200e,
+        ));
 
         cache.apply_msg(PcapMsg::DnsMapping {
             ip,
@@ -979,8 +984,8 @@ mod tests {
             0x00, 0x00, // NSCOUNT = 0
             0x00, 0x00, // ARCOUNT = 0
             // Question: example.com
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-            0x00, 0x01, // QTYPE = A
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x01, // QTYPE = A
             0x00, 0x01, // QCLASS = IN
             // Answer: example.com -> 93.184.216.34
             0xc0, 0x0c, // Name pointer to offset 12
@@ -1085,8 +1090,7 @@ mod tests {
             0x01, 0x00, // Flags: query (QR=0)
             0x00, 0x01, // QDCOUNT = 1
             0x00, 0x00, // ANCOUNT = 0
-            0x00, 0x00, 0x00, 0x00,
-            // Question
+            0x00, 0x00, 0x00, 0x00, // Question
             0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
             0x01, 0x00, 0x01,
         ];
@@ -1104,8 +1108,7 @@ mod tests {
             0x81, 0x80, // Flags: response
             0x00, 0x01, // QDCOUNT = 1
             0x00, 0x00, // ANCOUNT = 0
-            0x00, 0x00, 0x00, 0x00,
-            // Question
+            0x00, 0x00, 0x00, 0x00, // Question
             0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
             0x01, 0x00, 0x01,
         ];
@@ -1127,9 +1130,7 @@ mod tests {
     #[test]
     fn dns_name_parse_simple() {
         // Simple domain name: "test.com"
-        let packet = vec![
-            0x04, b't', b'e', b's', b't', 0x03, b'c', b'o', b'm', 0x00,
-        ];
+        let packet = vec![0x04, b't', b'e', b's', b't', 0x03, b'c', b'o', b'm', 0x00];
         let mut offset = 0;
         let result = parse_dns_name(&packet, &mut offset, 0);
         assert_eq!(result, Some("test.com".to_string()));
@@ -1207,7 +1208,7 @@ mod tests {
             0x02, // ServerHello (not ClientHello)
             0x00, 0x00, 0x0c, // Handshake length
             0x03, 0x03, // Version
-            // ... rest would be server hello data
+                  // ... rest would be server hello data
         ];
         let result = parse_tls_sni(&data);
         assert!(result.is_none());

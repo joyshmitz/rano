@@ -9,7 +9,7 @@
 #![allow(clippy::manual_map)]
 #![allow(clippy::needless_borrow)]
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -509,7 +509,11 @@ enum AlertKind {
     /// Total connections exceeded threshold
     MaxConnections { current: u64, threshold: u64 },
     /// Provider connections exceeded threshold
-    MaxPerProvider { provider: Provider, current: u64, threshold: u64 },
+    MaxPerProvider {
+        provider: Provider,
+        current: u64,
+        threshold: u64,
+    },
     /// Connection exceeded duration threshold
     LongDuration { duration_ms: u64, threshold_ms: u64 },
     /// Connection to unresolved domain
@@ -966,7 +970,10 @@ impl RunContext {
         let patterns = args.patterns.join(", ");
         // Generate session name or use override
         let session_name = args.session_name.clone().unwrap_or_else(|| {
-            generate_session_name(&args.patterns, primary_provider.unwrap_or(Provider::Unknown))
+            generate_session_name(
+                &args.patterns,
+                primary_provider.unwrap_or(Provider::Unknown),
+            )
         });
         Self {
             run_id,
@@ -1016,7 +1023,8 @@ fn generate_session_name(patterns: &[String], primary_provider: Provider) -> Str
     };
 
     // First pattern or 'default'
-    let pattern = patterns.first()
+    let pattern = patterns
+        .first()
         .map(|p| p.to_lowercase())
         .unwrap_or_else(|| "default".to_string());
 
@@ -1086,10 +1094,10 @@ impl OutputStyle {
         // Blue/Orange/White are typically safe for most color vision deficiencies
         if self.theme == Theme::Colorblind {
             return Some(match provider {
-                Provider::Anthropic => AnsiColor::BrightBlue,   // Bright blue
-                Provider::OpenAI => AnsiColor::Yellow,          // Orange-ish (yellow in ANSI)
-                Provider::Google => AnsiColor::White,           // White/light gray
-                Provider::Unknown => AnsiColor::BrightBlack,    // Dark gray
+                Provider::Anthropic => AnsiColor::BrightBlue, // Bright blue
+                Provider::OpenAI => AnsiColor::Yellow,        // Orange-ish (yellow in ANSI)
+                Provider::Google => AnsiColor::White,         // White/light gray
+                Provider::Unknown => AnsiColor::BrightBlack,  // Dark gray
             });
         }
         Some(match provider {
@@ -1103,10 +1111,10 @@ impl OutputStyle {
     /// Returns a distinctive symbol for each provider (used in colorblind theme)
     fn provider_symbol(self, provider: Provider) -> &'static str {
         match provider {
-            Provider::Anthropic => "●",  // Filled circle
-            Provider::OpenAI => "◆",     // Diamond
-            Provider::Google => "▲",     // Triangle
-            Provider::Unknown => "○",    // Empty circle
+            Provider::Anthropic => "●", // Filled circle
+            Provider::OpenAI => "◆",    // Diamond
+            Provider::Google => "▲",    // Triangle
+            Provider::Unknown => "○",   // Empty circle
         }
     }
 
@@ -1114,10 +1122,10 @@ impl OutputStyle {
     fn provider_bar_char(self, provider: Provider) -> char {
         if self.theme == Theme::Colorblind {
             match provider {
-                Provider::Anthropic => '█',  // Solid
-                Provider::OpenAI => '▓',     // Dense shade
-                Provider::Google => '▒',     // Medium shade
-                Provider::Unknown => '░',    // Light shade
+                Provider::Anthropic => '█', // Solid
+                Provider::OpenAI => '▓',    // Dense shade
+                Provider::Google => '▒',    // Medium shade
+                Provider::Unknown => '░',   // Light shade
             }
         } else {
             '█'
@@ -1208,9 +1216,11 @@ impl SqliteWriter {
     }
 
     fn shutdown(mut self, run_id: String, connects: u64, closes: u64) -> u64 {
-        let _ = self
-            .sender
-            .send(SqliteMsg::Shutdown { run_id, connects, closes });
+        let _ = self.sender.send(SqliteMsg::Shutdown {
+            run_id,
+            connects,
+            closes,
+        });
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -1465,7 +1475,9 @@ fn main() {
     };
 
     let mut dns_cache: HashMap<IpAddr, DnsCacheEntry> = HashMap::new();
-    let mut domain_cache = pcap_handle.as_ref().map(|_| pcap_capture::DomainCache::new());
+    let mut domain_cache = pcap_handle
+        .as_ref()
+        .map(|_| pcap_capture::DomainCache::new());
     let mut ancestry_cache = AncestryCache::new(Duration::from_secs(ANCESTRY_CACHE_TTL_SECS));
 
     let mut active: HashMap<ConnKey, ConnInfo> = HashMap::new();
@@ -1588,11 +1600,8 @@ fn main() {
                 };
 
                 // Check if this connection would trigger an alert (for SQLite flag)
-                let triggers_alert = would_trigger_connection_alert(
-                    &args.alert,
-                    domain.as_deref(),
-                    entry.remote_ip,
-                );
+                let triggers_alert =
+                    would_trigger_connection_alert(&args.alert, domain.as_deref(), entry.remote_ip);
 
                 active.insert(key.clone(), info);
 
@@ -1670,13 +1679,7 @@ fn main() {
                 }
 
                 // Check threshold alerts (max connections, max per provider)
-                check_threshold_alerts(
-                    &args.alert,
-                    &mut alert_state,
-                    &stats,
-                    args.json,
-                    style,
-                );
+                check_threshold_alerts(&args.alert, &mut alert_state, &stats, args.json, style);
             } else if let Some(info) = active.get_mut(&key) {
                 info.last_seen = now;
             }
@@ -1699,11 +1702,8 @@ fn main() {
 
                 let ts = now_rfc3339();
                 // Track retry pattern on close events
-                let retry_warning = retry_tracker.track_connection(
-                    key.remote_ip,
-                    key.remote_port,
-                    info.pid,
-                );
+                let retry_warning =
+                    retry_tracker.track_connection(key.remote_ip, key.remote_port, info.pid);
                 let retry_count = retry_warning.as_ref().map(|w| w.count);
 
                 // Emit retry warning if detected
@@ -1713,10 +1713,7 @@ fn main() {
                         let domain_str = info.domain.as_deref().unwrap_or(&ip_str);
                         let msg = format!(
                             "\u{26A0} Retry pattern: {} connections to {}:{} in {}s",
-                            warning.count,
-                            domain_str,
-                            key.remote_port,
-                            warning.window_seconds
+                            warning.count, domain_str, key.remote_port, warning.window_seconds
                         );
                         if args.json {
                             eprintln!(
@@ -1737,10 +1734,7 @@ fn main() {
                         if let Some(ref writer) = log_writer {
                             writer.write_line(&format!(
                                 "\u{26A0} Retry pattern: {} connections to {}:{} in {}s",
-                                warning.count,
-                                domain_str,
-                                key.remote_port,
-                                warning.window_seconds
+                                warning.count, domain_str, key.remote_port, warning.window_seconds
                             ));
                         }
                     }
@@ -1807,10 +1801,7 @@ fn main() {
         if args.stats_interval_ms > 0 && !args.json {
             if let Ok(elapsed) = now.duration_since(last_stats) {
                 if elapsed >= Duration::from_millis(args.stats_interval_ms) {
-                    if args.stats_cycle_ms > 0
-                        && args.stats_views.len() > 1
-                        && !args.summary_only
-                    {
+                    if args.stats_cycle_ms > 0 && args.stats_views.len() > 1 && !args.summary_only {
                         let cycle_due = now
                             .duration_since(last_cycle)
                             .map(|d| d >= Duration::from_millis(args.stats_cycle_ms))
@@ -1840,7 +1831,8 @@ fn main() {
     }
 
     if let Some(writer) = sqlite_writer {
-        stats.sqlite_dropped = writer.shutdown(run_ctx.run_id.clone(), stats.connects, stats.closes);
+        stats.sqlite_dropped =
+            writer.shutdown(run_ctx.run_id.clone(), stats.connects, stats.closes);
     }
 
     if let Some(handle) = pcap_handle.take() {
@@ -1864,7 +1856,7 @@ fn parse_cli() -> Result<Cli, String> {
     if args.len() <= 1 {
         return Ok(Cli {
             command: None,
-            monitor: load_monitor_args(&[])? ,
+            monitor: load_monitor_args(&[])?,
         });
     }
 
@@ -1982,7 +1974,9 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
             "--pid" => {
                 i += 1;
                 let value = require_value(argv, i, "--pid")?;
-                let pid = value.parse::<u32>().map_err(|_| "Invalid --pid value".to_string())?;
+                let pid = value
+                    .parse::<u32>()
+                    .map_err(|_| "Invalid --pid value".to_string())?;
                 args.pids.push(pid);
                 i += 1;
             }
@@ -2954,7 +2948,9 @@ fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> 
             }
             _ => {
                 eprintln!(
-                    "warning: unknown config key '{}' in {}", key, path.display()
+                    "warning: unknown config key '{}' in {}",
+                    key,
+                    path.display()
                 );
             }
         }
@@ -3440,7 +3436,11 @@ fn paint(text: &str, color: Option<AnsiColor>, bold: bool, dim: bool, enabled: b
 }
 
 fn default_patterns() -> Vec<String> {
-    vec!["claude".to_string(), "codex".to_string(), "gemini".to_string()]
+    vec![
+        "claude".to_string(),
+        "codex".to_string(),
+        "gemini".to_string(),
+    ]
 }
 
 fn resolve_domain_mode(args: &MonitorArgs) -> (DomainMode, Option<String>) {
@@ -3547,10 +3547,20 @@ fn banner(
         args.include_udp,
         args.include_listening,
         args.once,
-        if args.no_sqlite { "disabled" } else { &args.sqlite_path },
+        if args.no_sqlite {
+            "disabled"
+        } else {
+            &args.sqlite_path
+        },
         args.stats_interval_ms,
-        args.log_file.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".to_string()),
-        args.log_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".to_string()),
+        args.log_file
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        args.log_dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".to_string()),
     );
 
     if args.json {
@@ -3564,7 +3574,16 @@ fn banner(
         if args.json {
             eprintln!("{}", warning);
         } else {
-            println!("{}", paint(&warning, Some(AnsiColor::BrightYellow), true, false, style.color));
+            println!(
+                "{}",
+                paint(
+                    &warning,
+                    Some(AnsiColor::BrightYellow),
+                    true,
+                    false,
+                    style.color
+                )
+            );
         }
         if let Some(writer) = log_writer.as_ref() {
             writer.write_line(&strip_ansi(&warning));
@@ -3588,19 +3607,15 @@ fn log_format_for_output(json_mode: bool, log_format: LogFormat) -> LogFormat {
 // --- Alert System Functions ---
 
 /// Check if an alert should be emitted (respecting cooldown).
-fn should_emit_alert(
-    state: &mut AlertState,
-    sig: &AlertSignature,
-    cooldown_ms: u64,
-) -> bool {
+fn should_emit_alert(state: &mut AlertState, sig: &AlertSignature, cooldown_ms: u64) -> bool {
     let now = SystemTime::now();
 
     // Prevent memory leak from stale keys
     if state.last_alert.len() > 5000 {
         let window = Duration::from_millis(cooldown_ms);
-        state.last_alert.retain(|_, ts| {
-            now.duration_since(*ts).unwrap_or_default() < window
-        });
+        state
+            .last_alert
+            .retain(|_, ts| now.duration_since(*ts).unwrap_or_default() < window);
     }
 
     if let Some(last) = state.last_alert.get(sig) {
@@ -3701,25 +3716,48 @@ fn format_json_alert(
     ];
 
     let (kind_str, extra) = match kind {
-        AlertKind::DomainMatch { domain, pattern } => {
-            ("domain_match", format!(",\"pattern\":\"{}\",\"domain\":\"{}\"", pattern, domain))
-        }
-        AlertKind::MaxConnections { current, threshold } => {
-            ("max_connections", format!(",\"threshold\":{},\"actual\":{}", threshold, current))
-        }
-        AlertKind::MaxPerProvider { provider, current, threshold } => {
-            ("max_per_provider", format!(",\"provider\":\"{}\",\"threshold\":{},\"actual\":{}", provider.label(), threshold, current))
-        }
-        AlertKind::LongDuration { duration_ms, threshold_ms } => {
-            ("long_duration", format!(",\"duration_ms\":{},\"threshold_ms\":{}", duration_ms, threshold_ms))
-        }
-        AlertKind::UnknownDomain { remote_ip } => {
-            ("unknown_domain", format!(",\"remote_ip\":\"{}\"", remote_ip))
-        }
+        AlertKind::DomainMatch { domain, pattern } => (
+            "domain_match",
+            format!(",\"pattern\":\"{}\",\"domain\":\"{}\"", pattern, domain),
+        ),
+        AlertKind::MaxConnections { current, threshold } => (
+            "max_connections",
+            format!(",\"threshold\":{},\"actual\":{}", threshold, current),
+        ),
+        AlertKind::MaxPerProvider {
+            provider,
+            current,
+            threshold,
+        } => (
+            "max_per_provider",
+            format!(
+                ",\"provider\":\"{}\",\"threshold\":{},\"actual\":{}",
+                provider.label(),
+                threshold,
+                current
+            ),
+        ),
+        AlertKind::LongDuration {
+            duration_ms,
+            threshold_ms,
+        } => (
+            "long_duration",
+            format!(
+                ",\"duration_ms\":{},\"threshold_ms\":{}",
+                duration_ms, threshold_ms
+            ),
+        ),
+        AlertKind::UnknownDomain { remote_ip } => (
+            "unknown_domain",
+            format!(",\"remote_ip\":\"{}\"", remote_ip),
+        ),
     };
 
     parts.push(format!("\"kind\":\"{}\"", kind_str));
-    parts.push(format!("\"severity\":\"{}\"", severity.label().to_lowercase()));
+    parts.push(format!(
+        "\"severity\":\"{}\"",
+        severity.label().to_lowercase()
+    ));
 
     if let Some(key) = conn_key {
         let proto = match key.proto {
@@ -3728,7 +3766,10 @@ fn format_json_alert(
         };
         parts.push(format!("\"proto\":\"{}\"", proto));
         parts.push(format!("\"local\":\"{}:{}\"", key.local_ip, key.local_port));
-        parts.push(format!("\"remote\":\"{}:{}\"", key.remote_ip, key.remote_port));
+        parts.push(format!(
+            "\"remote\":\"{}:{}\"",
+            key.remote_ip, key.remote_port
+        ));
     }
 
     if let Some(info) = conn_info {
@@ -3764,12 +3805,27 @@ fn format_pretty_alert(
             format!("domain_match | {} matched {}", domain, pattern)
         }
         AlertKind::MaxConnections { current, threshold } => {
-            format!("max_connections | {}/{} active connections", current, threshold)
+            format!(
+                "max_connections | {}/{} active connections",
+                current, threshold
+            )
         }
-        AlertKind::MaxPerProvider { provider, current, threshold } => {
-            format!("max_per_provider | {}: {}/{} connections", provider.label(), current, threshold)
+        AlertKind::MaxPerProvider {
+            provider,
+            current,
+            threshold,
+        } => {
+            format!(
+                "max_per_provider | {}: {}/{} connections",
+                provider.label(),
+                current,
+                threshold
+            )
         }
-        AlertKind::LongDuration { duration_ms, threshold_ms } => {
+        AlertKind::LongDuration {
+            duration_ms,
+            threshold_ms,
+        } => {
             format!("long_duration | {}ms > {}ms", duration_ms, threshold_ms)
         }
         AlertKind::UnknownDomain { remote_ip } => {
@@ -3782,13 +3838,24 @@ fn format_pretty_alert(
             Proto::Tcp => "tcp",
             Proto::Udp => "udp",
         };
-        format!(" | pid={} | {} | {} | {}:{} -> {}:{}",
-            info.pid, info.comm, proto, key.local_ip, key.local_port, key.remote_ip, key.remote_port)
+        format!(
+            " | pid={} | {} | {} | {}:{} -> {}:{}",
+            info.pid,
+            info.comm,
+            proto,
+            key.local_ip,
+            key.local_port,
+            key.remote_ip,
+            key.remote_port
+        )
     } else {
         String::new()
     };
 
-    format!("{} {} | {} | {}{}", alert_prefix, ts, severity_str, kind_str, conn_str)
+    format!(
+        "{} {} | {} | {}{}",
+        alert_prefix, ts, severity_str, kind_str, conn_str
+    )
 }
 
 /// Check if a connection would trigger a connection-level alert (without emitting).
@@ -3829,7 +3896,9 @@ fn check_connection_alerts(
     }
 
     // Check domain patterns
-    if let Some(pattern) = check_domain_patterns(info.domain.as_deref(), &alert_config.domain_patterns) {
+    if let Some(pattern) =
+        check_domain_patterns(info.domain.as_deref(), &alert_config.domain_patterns)
+    {
         let sig = AlertSignature::DomainMatch {
             domain: info.domain.clone().unwrap_or_default(),
             pattern: pattern.clone(),
@@ -3839,16 +3908,36 @@ fn check_connection_alerts(
                 domain: info.domain.clone().unwrap_or_default(),
                 pattern,
             };
-            emit_alert(&kind, AlertSeverity::Critical, Some(key), Some(info), alert_config.bell, json_mode, style);
+            emit_alert(
+                &kind,
+                AlertSeverity::Critical,
+                Some(key),
+                Some(info),
+                alert_config.bell,
+                json_mode,
+                style,
+            );
         }
     }
 
     // Check unknown domain
     if alert_config.alert_unknown_domain && info.domain.is_none() {
-        let sig = AlertSignature::UnknownDomain { remote_ip: key.remote_ip };
+        let sig = AlertSignature::UnknownDomain {
+            remote_ip: key.remote_ip,
+        };
         if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
-            let kind = AlertKind::UnknownDomain { remote_ip: key.remote_ip };
-            emit_alert(&kind, AlertSeverity::Warning, Some(key), Some(info), alert_config.bell, json_mode, style);
+            let kind = AlertKind::UnknownDomain {
+                remote_ip: key.remote_ip,
+            };
+            emit_alert(
+                &kind,
+                AlertSeverity::Warning,
+                Some(key),
+                Some(info),
+                alert_config.bell,
+                json_mode,
+                style,
+            );
         }
     }
 }
@@ -3874,7 +3963,15 @@ fn check_threshold_alerts(
                     current: stats.active,
                     threshold,
                 };
-                emit_alert(&kind, AlertSeverity::Warning, None, None, alert_config.bell, json_mode, style);
+                emit_alert(
+                    &kind,
+                    AlertSeverity::Warning,
+                    None,
+                    None,
+                    alert_config.bell,
+                    json_mode,
+                    style,
+                );
             }
         }
     }
@@ -3883,14 +3980,24 @@ fn check_threshold_alerts(
     if let Some(threshold) = alert_config.max_per_provider {
         for (provider, count) in &stats.per_provider {
             if *count >= threshold {
-                let sig = AlertSignature::MaxPerProvider { provider: *provider };
+                let sig = AlertSignature::MaxPerProvider {
+                    provider: *provider,
+                };
                 if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
                     let kind = AlertKind::MaxPerProvider {
                         provider: *provider,
                         current: *count,
                         threshold,
                     };
-                    emit_alert(&kind, AlertSeverity::Warning, None, None, alert_config.bell, json_mode, style);
+                    emit_alert(
+                        &kind,
+                        AlertSeverity::Warning,
+                        None,
+                        None,
+                        alert_config.bell,
+                        json_mode,
+                        style,
+                    );
                 }
             }
         }
@@ -3898,10 +4005,7 @@ fn check_threshold_alerts(
 }
 
 /// Check if a close event would trigger a duration alert (without emitting).
-fn would_trigger_duration_alert(
-    alert_config: &AlertConfig,
-    duration_ms: Option<u64>,
-) -> bool {
+fn would_trigger_duration_alert(alert_config: &AlertConfig, duration_ms: Option<u64>) -> bool {
     if !alert_config.is_enabled() {
         return false;
     }
@@ -3929,13 +4033,23 @@ fn check_duration_alert(
 
     if let Some(threshold_ms) = alert_config.duration_threshold_ms {
         if duration_ms > threshold_ms {
-            let sig = AlertSignature::LongDuration { conn_key: key.clone() };
+            let sig = AlertSignature::LongDuration {
+                conn_key: key.clone(),
+            };
             if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
                 let kind = AlertKind::LongDuration {
                     duration_ms,
                     threshold_ms,
                 };
-                emit_alert(&kind, AlertSeverity::Warning, Some(key), Some(info), alert_config.bell, json_mode, style);
+                emit_alert(
+                    &kind,
+                    AlertSeverity::Warning,
+                    Some(key),
+                    Some(info),
+                    alert_config.bell,
+                    json_mode,
+                    style,
+                );
             }
         }
     }
@@ -4074,7 +4188,13 @@ fn format_pretty_event(
         _ => event,
     };
 
-    let event_text = paint(event_label, style.event_color(event), true, false, style.color);
+    let event_text = paint(
+        event_label,
+        style.event_color(event),
+        true,
+        false,
+        style.color,
+    );
     let provider_text = paint(
         provider.label(),
         style.provider_color(provider),
@@ -4090,11 +4210,29 @@ fn format_pretty_event(
         style.color,
     );
     let comm_text = paint(comm, Some(AnsiColor::BrightWhite), true, false, style.color);
-    let proto_text = paint(proto, Some(AnsiColor::BrightMagenta), true, false, style.color);
+    let proto_text = paint(
+        proto,
+        Some(AnsiColor::BrightMagenta),
+        true,
+        false,
+        style.color,
+    );
     let domain_text = if domain == "unknown" {
-        paint(domain, Some(AnsiColor::BrightBlack), false, true, style.color)
+        paint(
+            domain,
+            Some(AnsiColor::BrightBlack),
+            false,
+            true,
+            style.color,
+        )
     } else {
-        paint(domain, Some(AnsiColor::BrightWhite), false, false, style.color)
+        paint(
+            domain,
+            Some(AnsiColor::BrightWhite),
+            false,
+            false,
+            style.color,
+        )
     };
     let ts_text = if style.color {
         paint(ts, Some(AnsiColor::BrightBlack), false, true, style.color)
@@ -4102,14 +4240,22 @@ fn format_pretty_event(
         ts.to_string()
     };
 
-    let duration_text = duration_ms.map(|ms| format!(" dur={}ms", ms)).unwrap_or_default();
+    let duration_text = duration_ms
+        .map(|ms| format!(" dur={}ms", ms))
+        .unwrap_or_default();
     let process_text = if let Some(chain) = ancestry {
         if chain.is_empty() {
             format!("{} | {}", pid_text, comm_text)
         } else {
             let display = truncate_ancestry_list(chain);
             let joined = display.join(" \u{2192} ");
-            paint(&joined, Some(AnsiColor::BrightWhite), true, false, style.color)
+            paint(
+                &joined,
+                Some(AnsiColor::BrightWhite),
+                true,
+                false,
+                style.color,
+            )
         }
     } else {
         format!("{} | {}", pid_text, comm_text)
@@ -4188,27 +4334,72 @@ fn summary(
         return;
     }
 
-    println!("{}", paint("Summary", style.accent(), true, false, style.color));
     println!(
-        "  {} {}",
-        paint("connects", Some(AnsiColor::BrightWhite), true, false, style.color),
-        paint(&stats.connects.to_string(), Some(AnsiColor::BrightGreen), true, false, style.color)
+        "{}",
+        paint("Summary", style.accent(), true, false, style.color)
     );
     println!(
         "  {} {}",
-        paint("closes", Some(AnsiColor::BrightWhite), true, false, style.color),
-        paint(&stats.closes.to_string(), Some(AnsiColor::BrightYellow), true, false, style.color)
+        paint(
+            "connects",
+            Some(AnsiColor::BrightWhite),
+            true,
+            false,
+            style.color
+        ),
+        paint(
+            &stats.connects.to_string(),
+            Some(AnsiColor::BrightGreen),
+            true,
+            false,
+            style.color
+        )
+    );
+    println!(
+        "  {} {}",
+        paint(
+            "closes",
+            Some(AnsiColor::BrightWhite),
+            true,
+            false,
+            style.color
+        ),
+        paint(
+            &stats.closes.to_string(),
+            Some(AnsiColor::BrightYellow),
+            true,
+            false,
+            style.color
+        )
     );
     println!(
         "  {} {} (peak={})",
-        paint("active", Some(AnsiColor::BrightWhite), true, false, style.color),
-        paint(&stats.active.to_string(), Some(AnsiColor::BrightCyan), true, false, style.color),
+        paint(
+            "active",
+            Some(AnsiColor::BrightWhite),
+            true,
+            false,
+            style.color
+        ),
+        paint(
+            &stats.active.to_string(),
+            Some(AnsiColor::BrightCyan),
+            true,
+            false,
+            style.color
+        ),
         stats.peak_active
     );
     if stats.sqlite_dropped > 0 {
         println!(
             "  {} {}",
-            paint("sqlite_dropped", Some(AnsiColor::BrightWhite), true, false, style.color),
+            paint(
+                "sqlite_dropped",
+                Some(AnsiColor::BrightWhite),
+                true,
+                false,
+                style.color
+            ),
             paint(
                 &stats.sqlite_dropped.to_string(),
                 Some(AnsiColor::BrightRed),
@@ -4227,7 +4418,13 @@ fn summary(
         };
         println!(
             "  {} {}",
-            paint("alerts", Some(AnsiColor::BrightWhite), true, false, style.color),
+            paint(
+                "alerts",
+                Some(AnsiColor::BrightWhite),
+                true,
+                false,
+                style.color
+            ),
             paint(
                 &alert_text,
                 Some(AnsiColor::BrightRed),
@@ -4242,14 +4439,29 @@ fn summary(
         let avg = stats.duration_ms_total / stats.duration_ms_samples;
         println!(
             "  {} {}ms (max={}ms)",
-            paint("avg_duration", Some(AnsiColor::BrightWhite), true, false, style.color),
-            paint(&avg.to_string(), Some(AnsiColor::BrightCyan), true, false, style.color),
+            paint(
+                "avg_duration",
+                Some(AnsiColor::BrightWhite),
+                true,
+                false,
+                style.color
+            ),
+            paint(
+                &avg.to_string(),
+                Some(AnsiColor::BrightCyan),
+                true,
+                false,
+                style.color
+            ),
             stats.duration_ms_max
         );
     }
 
     if !stats.per_provider.is_empty() {
-        println!("{}", paint("  Providers", style.accent(), true, false, style.color));
+        println!(
+            "{}",
+            paint("  Providers", style.accent(), true, false, style.color)
+        );
         for (provider, count) in stats.per_provider.iter() {
             let name = paint(
                 provider.label(),
@@ -4263,21 +4475,30 @@ fn summary(
     }
 
     if !stats.per_domain.is_empty() {
-        println!("{}", paint("  Top Domains", style.accent(), true, false, style.color));
+        println!(
+            "{}",
+            paint("  Top Domains", style.accent(), true, false, style.color)
+        );
         for (name, count) in top_n_string(&stats.per_domain, stats_top) {
             println!("    {} {}", count, name);
         }
     }
 
     if !stats.per_ip.is_empty() {
-        println!("{}", paint("  Top IPs", style.accent(), true, false, style.color));
+        println!(
+            "{}",
+            paint("  Top IPs", style.accent(), true, false, style.color)
+        );
         for (ip, count) in top_n_string(&stats.per_ip, stats_top) {
             println!("    {} {}", count, ip);
         }
     }
 
     if !stats.per_comm.is_empty() {
-        println!("{}", paint("  Top Processes", style.accent(), true, false, style.color));
+        println!(
+            "{}",
+            paint("  Top Processes", style.accent(), true, false, style.color)
+        );
         for (comm, count) in top_n_string(&stats.per_comm, stats_top) {
             println!("    {} {}", count, comm);
         }
@@ -4286,13 +4507,24 @@ fn summary(
     if let Some(writer) = log_writer {
         let line = format!(
             "summary connects={} closes={} active={} peak_active={} sqlite_dropped={} alerts={} suppressed={}",
-            stats.connects, stats.closes, stats.active, stats.peak_active, stats.sqlite_dropped, alert_count, suppressed_count
+            stats.connects,
+            stats.closes,
+            stats.active,
+            stats.peak_active,
+            stats.sqlite_dropped,
+            alert_count,
+            suppressed_count
         );
         writer.write_line(&line);
     }
 }
 
-fn format_json_summary(stats: &Stats, domain_mode: &str, alert_count: u64, suppressed_count: u64) -> String {
+fn format_json_summary(
+    stats: &Stats,
+    domain_mode: &str,
+    alert_count: u64,
+    suppressed_count: u64,
+) -> String {
     let mut out = String::new();
     out.push('{');
     out.push_str("\"summary\":{");
@@ -4300,13 +4532,28 @@ fn format_json_summary(stats: &Stats, domain_mode: &str, alert_count: u64, suppr
     push_json_num(&mut out, "closes", stats.closes as i64, false);
     push_json_num(&mut out, "active", stats.active as i64, false);
     push_json_num(&mut out, "peak_active", stats.peak_active as i64, false);
-    push_json_num(&mut out, "sqlite_dropped", stats.sqlite_dropped as i64, false);
+    push_json_num(
+        &mut out,
+        "sqlite_dropped",
+        stats.sqlite_dropped as i64,
+        false,
+    );
     push_json_num(&mut out, "alerts", alert_count as i64, false);
-    push_json_num(&mut out, "alerts_suppressed", suppressed_count as i64, false);
+    push_json_num(
+        &mut out,
+        "alerts_suppressed",
+        suppressed_count as i64,
+        false,
+    );
     if stats.duration_ms_samples > 0 {
         let avg = stats.duration_ms_total / stats.duration_ms_samples;
         push_json_num(&mut out, "avg_duration_ms", avg as i64, false);
-        push_json_num(&mut out, "max_duration_ms", stats.duration_ms_max as i64, false);
+        push_json_num(
+            &mut out,
+            "max_duration_ms",
+            stats.duration_ms_max as i64,
+            false,
+        );
     }
     push_json_map_ip(&mut out, "per_ip", &stats.per_ip, false);
     push_json_map_str(&mut out, "per_domain", &stats.per_domain, false);
@@ -4360,7 +4607,13 @@ fn print_provider_stats(stats: &Stats, width: usize, style: OutputStyle) {
     ];
     println!(
         "{}",
-        paint("Live Stats [provider]", style.accent(), true, false, style.color)
+        paint(
+            "Live Stats [provider]",
+            style.accent(),
+            true,
+            false,
+            style.color
+        )
     );
     for provider in providers {
         let count = *stats.per_provider.get(&provider).unwrap_or(&0);
@@ -4372,7 +4625,13 @@ fn print_provider_stats(stats: &Stats, width: usize, style: OutputStyle) {
             width = width
         );
         let bar = if style.color {
-            paint(&bar_plain, style.provider_color(provider), false, false, style.color)
+            paint(
+                &bar_plain,
+                style.provider_color(provider),
+                false,
+                false,
+                style.color,
+            )
         } else {
             bar_plain
         };
@@ -4523,7 +4782,9 @@ fn start_sqlite_writer(
     let log_clone = log_writer.clone();
     let path = args.sqlite_path.to_string();
     let handle = std::thread::spawn(move || {
-        sqlite_writer_loop(path, run_ctx, receiver, ready_tx, log_clone, batch_size, flush_ms);
+        sqlite_writer_loop(
+            path, run_ctx, receiver, ready_tx, log_clone, batch_size, flush_ms,
+        );
     });
 
     let start_result = match ready_rx.recv() {
@@ -4696,14 +4957,12 @@ fn resolve_repo(update: &UpdateCommand) -> Result<(String, String), Box<dyn std:
     const DEFAULT_REPO: &str = "rano";
 
     if update.owner.is_some() || update.repo.is_some() {
-        let owner = update
-            .owner
-            .clone()
-            .ok_or_else(|| "Missing --owner (both --owner and --repo are required when overriding).")?;
-        let repo = update
-            .repo
-            .clone()
-            .ok_or_else(|| "Missing --repo (both --owner and --repo are required when overriding).")?;
+        let owner = update.owner.clone().ok_or_else(
+            || "Missing --owner (both --owner and --repo are required when overriding).",
+        )?;
+        let repo = update.repo.clone().ok_or_else(
+            || "Missing --repo (both --owner and --repo are required when overriding).",
+        )?;
         return Ok((owner, repo));
     }
     if let (Ok(owner), Ok(repo)) = (env::var("RANO_OWNER"), env::var("RANO_REPO")) {
@@ -4968,7 +5227,9 @@ fn reverse_dns(ip: IpAddr) -> Option<String> {
                     sin6_family: libc::AF_INET6 as u16,
                     sin6_port: 0,
                     sin6_flowinfo: 0,
-                    sin6_addr: libc::in6_addr { s6_addr: v6.octets() },
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: v6.octets(),
+                    },
                     sin6_scope_id: 0,
                 };
                 let ret = libc::getnameinfo(
@@ -4996,7 +5257,11 @@ struct PidMeta {
     provider: Provider,
 }
 
-fn find_root_pids(patterns: &[String], exclude_patterns: &[String], explicit_pids: &[u32]) -> Vec<u32> {
+fn find_root_pids(
+    patterns: &[String],
+    exclude_patterns: &[String],
+    explicit_pids: &[u32],
+) -> Vec<u32> {
     let lowered: Vec<String> = patterns.iter().map(|p| p.to_lowercase()).collect();
     let excluded: Vec<String> = exclude_patterns.iter().map(|p| p.to_lowercase()).collect();
     let mut roots = Vec::new();
@@ -5017,10 +5282,17 @@ fn find_root_pids(patterns: &[String], exclude_patterns: &[String], explicit_pid
         let cmd = read_cmdline(pid).unwrap_or_default();
         let comm_l = comm.to_lowercase();
         let cmd_l = cmd.to_lowercase();
-        if !excluded.is_empty() && excluded.iter().any(|p| comm_l.contains(p) || cmd_l.contains(p)) {
+        if !excluded.is_empty()
+            && excluded
+                .iter()
+                .any(|p| comm_l.contains(p) || cmd_l.contains(p))
+        {
             continue;
         }
-        if lowered.iter().any(|p| comm_l.contains(p) || cmd_l.contains(p)) {
+        if lowered
+            .iter()
+            .any(|p| comm_l.contains(p) || cmd_l.contains(p))
+        {
             if seen.insert(pid) {
                 roots.push(pid);
             }
@@ -5186,7 +5458,7 @@ fn read_net_file(path: &str, proto: Proto, ipv6: bool) -> Vec<(Proto, NetEntry)>
             Ok(l) => l,
             Err(_) => continue,
         };
-        
+
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 10 {
             continue;
@@ -5335,11 +5607,7 @@ fn run_config_check() -> i32 {
 
     println!("{}", validator.summary());
 
-    if validator.is_valid() {
-        0
-    } else {
-        1
-    }
+    if validator.is_valid() { 0 } else { 1 }
 }
 
 fn run_config_show(json: bool) -> i32 {
@@ -5451,8 +5719,7 @@ fn run_export(args: ExportArgs) -> Result<(), String> {
         return Err(format!("SQLite file not found: {}", args.sqlite_path));
     }
 
-    let conn = Connection::open(path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
 
     let has_events = table_exists(&conn, "events")?;
     if !has_events {
@@ -5523,15 +5790,11 @@ fn run_export(args: ExportArgs) -> Result<(), String> {
         row_count += 1;
         #[allow(clippy::manual_is_multiple_of)]
         if row_count % 1000 == 0 {
-            writer
-                .flush()
-                .map_err(|e| format!("Write error: {}", e))?;
+            writer.flush().map_err(|e| format!("Write error: {}", e))?;
         }
     }
 
-    writer
-        .flush()
-        .map_err(|e| format!("Write error: {}", e))?;
+    writer.flush().map_err(|e| format!("Write error: {}", e))?;
     Ok(())
 }
 
@@ -5653,10 +5916,8 @@ fn csv_escape(value: &str) -> String {
     if value.is_empty() {
         return String::new();
     }
-    let needs_quotes = value.contains(',')
-        || value.contains('"')
-        || value.contains('\n')
-        || value.contains('\r');
+    let needs_quotes =
+        value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r');
     if needs_quotes {
         let escaped = value.replace('"', "\"\"");
         format!("\"{}\"", escaped)
@@ -5769,8 +6030,7 @@ fn run_diff(args: DiffArgs) -> Result<(), String> {
         return Err(format!("SQLite file not found: {}", args.sqlite_path));
     }
 
-    let conn = Connection::open(path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
 
     let has_events = table_exists(&conn, "events")?;
     if !has_events {
@@ -5850,7 +6110,8 @@ fn compute_session_diff(
         let old_count = *old_domains.get(*domain).unwrap_or(&0);
         let new_count = *new_domains.get(*domain).unwrap_or(&0);
         if old_count > 0 {
-            let change_pct = ((new_count as f64 - old_count as f64) / old_count as f64).abs() * 100.0;
+            let change_pct =
+                ((new_count as f64 - old_count as f64) / old_count as f64).abs() * 100.0;
             if change_pct >= threshold_pct {
                 changed_domains.push(((*domain).clone(), old_count, new_count));
             }
@@ -5867,11 +6128,13 @@ fn compute_session_diff(
 
     // Compute process diffs
     let added_processes: Vec<String> = new_processes.difference(&old_processes).cloned().collect();
-    let removed_processes: Vec<String> = old_processes.difference(&new_processes).cloned().collect();
+    let removed_processes: Vec<String> =
+        old_processes.difference(&new_processes).cloned().collect();
 
     // Compute provider changes
     let mut provider_changes: HashMap<String, (i64, i64)> = HashMap::new();
-    let all_providers: HashSet<&String> = old_providers.keys().chain(new_providers.keys()).collect();
+    let all_providers: HashSet<&String> =
+        old_providers.keys().chain(new_providers.keys()).collect();
     for provider in all_providers {
         let old_count = *old_providers.get(provider).unwrap_or(&0);
         let new_count = *new_providers.get(provider).unwrap_or(&0);
@@ -5912,7 +6175,8 @@ fn get_session_domain_counts(
     conn: &Connection,
     run_id: &str,
 ) -> Result<HashMap<String, i64>, String> {
-    let sql = "SELECT COALESCE(domain, 'unknown'), COUNT(*) FROM events WHERE run_id = ? GROUP BY domain";
+    let sql =
+        "SELECT COALESCE(domain, 'unknown'), COUNT(*) FROM events WHERE run_id = ? GROUP BY domain";
     let mut stmt = conn
         .prepare(sql)
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
@@ -6010,7 +6274,12 @@ fn output_diff_pretty(result: &DiffResult, color_enabled: bool) -> Result<(), St
 
     // New domains
     if !result.new_domains.is_empty() {
-        println!("{}New Domains:{} ({} added)", green, reset, result.new_domains.len());
+        println!(
+            "{}New Domains:{} ({} added)",
+            green,
+            reset,
+            result.new_domains.len()
+        );
         for domain in &result.new_domains {
             println!("  {}+{} {}", green, reset, domain);
         }
@@ -6093,8 +6362,14 @@ fn output_diff_json(result: &DiffResult) -> Result<(), String> {
     // Manually construct JSON to avoid adding serde_json dependency
     let mut json = String::from("{\n");
 
-    json.push_str(&format!("  \"old_run_id\": \"{}\",\n", escape_json(&result.old_run_id)));
-    json.push_str(&format!("  \"new_run_id\": \"{}\",\n", escape_json(&result.new_run_id)));
+    json.push_str(&format!(
+        "  \"old_run_id\": \"{}\",\n",
+        escape_json(&result.old_run_id)
+    ));
+    json.push_str(&format!(
+        "  \"new_run_id\": \"{}\",\n",
+        escape_json(&result.new_run_id)
+    ));
 
     // new_domains array
     json.push_str("  \"new_domains\": [");
@@ -6219,8 +6494,7 @@ fn run_status(args: StatusArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    let conn = Connection::open(path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
 
     // Check if events table exists
     let has_events = table_exists(&conn, "events")?;
@@ -6333,10 +6607,7 @@ fn expand_status_template(template: &str, data: &StatusData) -> String {
     result = result.replace("{anthropic}", &data.anthropic.to_string());
     result = result.replace("{openai}", &data.openai.to_string());
     result = result.replace("{google}", &data.google.to_string());
-    result = result.replace(
-        "{session_name}",
-        data.session_name.as_deref().unwrap_or(""),
-    );
+    result = result.replace("{session_name}", data.session_name.as_deref().unwrap_or(""));
 
     result
 }
@@ -6351,8 +6622,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         return Err(format!("SQLite file not found: {}", args.sqlite_path));
     }
 
-    let conn = Connection::open(path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
 
     // Check schema
     let has_events = table_exists(&conn, "events")?;
@@ -6418,17 +6688,13 @@ struct ReportFilter {
 
 fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, String> {
     let sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
-    let result: Option<String> = conn
-        .query_row(sql, [table_name], |row| row.get(0))
-        .ok();
+    let result: Option<String> = conn.query_row(sql, [table_name], |row| row.get(0)).ok();
     Ok(result.is_some())
 }
 
 fn view_exists(conn: &Connection, view_name: &str) -> Result<bool, String> {
     let sql = "SELECT name FROM sqlite_master WHERE type='view' AND name=?";
-    let result: Option<String> = conn
-        .query_row(sql, [view_name], |row| row.get(0))
-        .ok();
+    let result: Option<String> = conn.query_row(sql, [view_name], |row| row.get(0)).ok();
     Ok(result.is_some())
 }
 
@@ -6440,8 +6706,13 @@ fn column_exists(conn: &Connection, table_name: &str, column: &str) -> Result<bo
     let mut rows = stmt
         .query([])
         .map_err(|e| format!("Failed to read schema: {}", e))?;
-    while let Some(row) = rows.next().map_err(|e| format!("Failed to read schema: {}", e))? {
-        let name: String = row.get(1).map_err(|e| format!("Failed to read schema: {}", e))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("Failed to read schema: {}", e))?
+    {
+        let name: String = row
+            .get(1)
+            .map_err(|e| format!("Failed to read schema: {}", e))?;
         if name == column {
             return Ok(true);
         }
@@ -6546,7 +6817,10 @@ fn parse_time_filter(input: &Option<String>) -> Result<Option<String>, String> {
         return Ok(Some(format!("{}T00:00:00Z", s)));
     }
 
-    Err(format!("Invalid timestamp format: {} (use RFC3339, YYYY-MM-DD, or relative like 1h/24h/7d)", s))
+    Err(format!(
+        "Invalid timestamp format: {} (use RFC3339, YYYY-MM-DD, or relative like 1h/24h/7d)",
+        s
+    ))
 }
 
 fn parse_relative_time(s: &str) -> Option<String> {
@@ -6595,7 +6869,10 @@ fn output_report_json(
 
     // Meta section
     out.push_str("  \"meta\": {\n");
-    out.push_str(&format!("    \"generated_at\": \"{}\",\n", system_time_to_rfc3339(SystemTime::now())));
+    out.push_str(&format!(
+        "    \"generated_at\": \"{}\",\n",
+        system_time_to_rfc3339(SystemTime::now())
+    ));
     if let Some(ref run_id) = filter.run_id {
         out.push_str(&format!("    \"run_id\": \"{}\",\n", run_id));
     }
@@ -6628,18 +6905,30 @@ fn output_report_json(
         if let Some(patterns) = &session.patterns {
             out.push_str(&format!("    \"patterns\": \"{}\",\n", patterns));
         }
-        out.push_str(&format!("    \"connects\": {},\n", session.connects.unwrap_or(0)));
-        out.push_str(&format!("    \"closes\": {}\n", session.closes.unwrap_or(0)));
+        out.push_str(&format!(
+            "    \"connects\": {},\n",
+            session.connects.unwrap_or(0)
+        ));
+        out.push_str(&format!(
+            "    \"closes\": {}\n",
+            session.closes.unwrap_or(0)
+        ));
         out.push_str("  },\n");
     }
 
     // Summary statistics
     let summary = query_summary(conn, filter)?;
     out.push_str("  \"summary\": {\n");
-    out.push_str(&format!("    \"total_events\": {},\n", summary.total_events));
+    out.push_str(&format!(
+        "    \"total_events\": {},\n",
+        summary.total_events
+    ));
     out.push_str(&format!("    \"connects\": {},\n", summary.connects));
     out.push_str(&format!("    \"closes\": {},\n", summary.closes));
-    out.push_str(&format!("    \"active\": {}\n", summary.connects.saturating_sub(summary.closes)));
+    out.push_str(&format!(
+        "    \"active\": {}\n",
+        summary.connects.saturating_sub(summary.closes)
+    ));
     out.push_str("  },\n");
 
     // Provider breakdown
@@ -6721,7 +7010,14 @@ fn output_report_pretty(
     color: bool,
 ) -> Result<(), String> {
     // Title
-    println!("\n{}", if color { "\x1b[1mrano report\x1b[0m" } else { "rano report" });
+    println!(
+        "\n{}",
+        if color {
+            "\x1b[1mrano report\x1b[0m"
+        } else {
+            "rano report"
+        }
+    );
     println!("{}", "=".repeat(60));
 
     // Time range (if provided)
@@ -6729,7 +7025,14 @@ fn output_report_pretty(
         let now_display = now_rfc3339();
         let since = filter.since.as_deref().unwrap_or("beginning");
         let until = filter.until.as_deref().unwrap_or(&now_display);
-        println!("\n{}", if color { "\x1b[1;36mRange\x1b[0m" } else { "Range" });
+        println!(
+            "\n{}",
+            if color {
+                "\x1b[1;36mRange\x1b[0m"
+            } else {
+                "Range"
+            }
+        );
         println!("  {} .. {}", since, until);
     }
 
@@ -6738,7 +7041,14 @@ fn output_report_pretty(
         && let Some(ref run_id) = filter.run_id
         && let Some(session) = query_session(conn, run_id)?
     {
-        println!("\n{}", if color { "\x1b[1;36mSession\x1b[0m" } else { "Session" });
+        println!(
+            "\n{}",
+            if color {
+                "\x1b[1;36mSession\x1b[0m"
+            } else {
+                "Session"
+            }
+        );
         println!("  Run ID:   {}", session.run_id);
         println!("  Started:  {}", session.start_ts);
         if let Some(end) = &session.end_ts {
@@ -6761,15 +7071,34 @@ fn output_report_pretty(
 
     // Summary
     let summary = query_summary(conn, filter)?;
-    println!("\n{}", if color { "\x1b[1;36mSummary\x1b[0m" } else { "Summary" });
-    println!("  Events:  {} total ({} connects, {} closes)",
-             summary.total_events, summary.connects, summary.closes);
-    println!("  Active:  {} connections", summary.connects.saturating_sub(summary.closes));
+    println!(
+        "\n{}",
+        if color {
+            "\x1b[1;36mSummary\x1b[0m"
+        } else {
+            "Summary"
+        }
+    );
+    println!(
+        "  Events:  {} total ({} connects, {} closes)",
+        summary.total_events, summary.connects, summary.closes
+    );
+    println!(
+        "  Active:  {} connections",
+        summary.connects.saturating_sub(summary.closes)
+    );
 
     // Providers
     let providers = query_providers(conn, filter)?;
     if !providers.is_empty() {
-        println!("\n{}", if color { "\x1b[1;36mProviders\x1b[0m" } else { "Providers" });
+        println!(
+            "\n{}",
+            if color {
+                "\x1b[1;36mProviders\x1b[0m"
+            } else {
+                "Providers"
+            }
+        );
         let provider_width = providers
             .iter()
             .map(|p| p.provider.len())
@@ -6835,7 +7164,11 @@ fn output_report_pretty(
         if !roots.is_empty() {
             println!(
                 "\n{}",
-                if color { "\x1b[1;36mSpawned From\x1b[0m" } else { "Spawned From" }
+                if color {
+                    "\x1b[1;36mSpawned From\x1b[0m"
+                } else {
+                    "Spawned From"
+                }
             );
             for root in roots {
                 println!("  {}: {} connections", root.root, root.connects);
@@ -6846,7 +7179,14 @@ fn output_report_pretty(
     // Top Domains
     let domains = query_top_domains(conn, filter, top)?;
     if !domains.is_empty() {
-        println!("\n{}", if color { "\x1b[1;36mTop Domains\x1b[0m" } else { "Top Domains" });
+        println!(
+            "\n{}",
+            if color {
+                "\x1b[1;36mTop Domains\x1b[0m"
+            } else {
+                "Top Domains"
+            }
+        );
         let provider_width = domains
             .iter()
             .map(|d| d.provider.len())
@@ -6896,7 +7236,14 @@ fn output_report_pretty(
     // Top IPs
     let ips = query_top_ips(conn, filter, top)?;
     if !ips.is_empty() {
-        println!("\n{}", if color { "\x1b[1;36mTop IPs\x1b[0m" } else { "Top IPs" });
+        println!(
+            "\n{}",
+            if color {
+                "\x1b[1;36mTop IPs\x1b[0m"
+            } else {
+                "Top IPs"
+            }
+        );
         let events_width = ips
             .iter()
             .map(|ip| ip.events.to_string().len())
@@ -7100,7 +7447,8 @@ fn query_session(conn: &Connection, run_id: &str) -> Result<Option<SessionInfo>,
 
 fn query_summary(conn: &Connection, filter: &ReportFilter) -> Result<SummaryStats, String> {
     let (sql, params) = build_summary_query(filter);
-    let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
 
     conn.query_row(&sql, params_refs.as_slice(), |row| {
         Ok(SummaryStats {
@@ -7108,7 +7456,8 @@ fn query_summary(conn: &Connection, filter: &ReportFilter) -> Result<SummaryStat
             connects: row.get(1)?,
             closes: row.get(2)?,
         })
-    }).map_err(|e| format!("Failed to query summary: {}", e))
+    })
+    .map_err(|e| format!("Failed to query summary: {}", e))
 }
 
 fn build_summary_query(filter: &ReportFilter) -> (String, Vec<String>) {
@@ -7116,7 +7465,7 @@ fn build_summary_query(filter: &ReportFilter) -> (String, Vec<String>) {
         "SELECT COUNT(*) as total,
                 COALESCE(SUM(CASE WHEN event='connect' THEN 1 ELSE 0 END), 0) as connects,
                 COALESCE(SUM(CASE WHEN event='close' THEN 1 ELSE 0 END), 0) as closes
-         FROM events WHERE 1=1"
+         FROM events WHERE 1=1",
     );
     let mut params: Vec<String> = Vec::new();
 
@@ -7138,19 +7487,23 @@ fn build_summary_query(filter: &ReportFilter) -> (String, Vec<String>) {
 
 fn query_providers(conn: &Connection, filter: &ReportFilter) -> Result<Vec<ProviderStats>, String> {
     let (sql, params) = build_providers_query(filter);
-    let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
 
-    let mut stmt = conn.prepare(&sql)
+    let mut stmt = conn
+        .prepare(&sql)
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
-    let rows = stmt.query_map(params_refs.as_slice(), |row| {
-        Ok(ProviderStats {
-            provider: row.get(0)?,
-            events: row.get(1)?,
-            connects: row.get(2)?,
-            closes: row.get(3)?,
+    let rows = stmt
+        .query_map(params_refs.as_slice(), |row| {
+            Ok(ProviderStats {
+                provider: row.get(0)?,
+                events: row.get(1)?,
+                connects: row.get(2)?,
+                closes: row.get(3)?,
+            })
         })
-    }).map_err(|e| format!("Failed to query providers: {}", e))?;
+        .map_err(|e| format!("Failed to query providers: {}", e))?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -7165,7 +7518,7 @@ fn build_providers_query(filter: &ReportFilter) -> (String, Vec<String>) {
                 COUNT(*) as events,
                 SUM(CASE WHEN event='connect' THEN 1 ELSE 0 END) as connects,
                 SUM(CASE WHEN event='close' THEN 1 ELSE 0 END) as closes
-         FROM events WHERE 1=1"
+         FROM events WHERE 1=1",
     );
     let mut params: Vec<String> = Vec::new();
 
@@ -7247,24 +7600,35 @@ fn build_ancestry_roots_query(filter: &ReportFilter, top: usize) -> (String, Vec
         params.push(until.clone());
     }
 
-    sql.push_str(&format!(" GROUP BY root_seg ORDER BY connects DESC LIMIT {}", top));
+    sql.push_str(&format!(
+        " GROUP BY root_seg ORDER BY connects DESC LIMIT {}",
+        top
+    ));
     (sql, params)
 }
 
-fn query_top_domains(conn: &Connection, filter: &ReportFilter, top: usize) -> Result<Vec<DomainStats>, String> {
+fn query_top_domains(
+    conn: &Connection,
+    filter: &ReportFilter,
+    top: usize,
+) -> Result<Vec<DomainStats>, String> {
     let (sql, params) = build_domains_query(filter, top);
-    let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
 
-    let mut stmt = conn.prepare(&sql)
+    let mut stmt = conn
+        .prepare(&sql)
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
-    let rows = stmt.query_map(params_refs.as_slice(), |row| {
-        Ok(DomainStats {
-            domain: row.get(0)?,
-            events: row.get(1)?,
-            provider: row.get(2)?,
+    let rows = stmt
+        .query_map(params_refs.as_slice(), |row| {
+            Ok(DomainStats {
+                domain: row.get(0)?,
+                events: row.get(1)?,
+                provider: row.get(2)?,
+            })
         })
-    }).map_err(|e| format!("Failed to query domains: {}", e))?;
+        .map_err(|e| format!("Failed to query domains: {}", e))?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -7278,7 +7642,7 @@ fn build_domains_query(filter: &ReportFilter, top: usize) -> (String, Vec<String
         "SELECT COALESCE(domain, 'unknown') as domain,
                 COUNT(*) as events,
                 provider
-         FROM events WHERE domain IS NOT NULL AND domain != ''"
+         FROM events WHERE domain IS NOT NULL AND domain != ''",
     );
     let mut params: Vec<String> = Vec::new();
 
@@ -7295,24 +7659,35 @@ fn build_domains_query(filter: &ReportFilter, top: usize) -> (String, Vec<String
         params.push(until.clone());
     }
 
-    sql.push_str(&format!(" GROUP BY domain, provider ORDER BY events DESC LIMIT {}", top));
+    sql.push_str(&format!(
+        " GROUP BY domain, provider ORDER BY events DESC LIMIT {}",
+        top
+    ));
     (sql, params)
 }
 
-fn query_top_ips(conn: &Connection, filter: &ReportFilter, top: usize) -> Result<Vec<IpStats>, String> {
+fn query_top_ips(
+    conn: &Connection,
+    filter: &ReportFilter,
+    top: usize,
+) -> Result<Vec<IpStats>, String> {
     let (sql, params) = build_ips_query(filter, top);
-    let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
 
-    let mut stmt = conn.prepare(&sql)
+    let mut stmt = conn
+        .prepare(&sql)
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
-    let rows = stmt.query_map(params_refs.as_slice(), |row| {
-        Ok(IpStats {
-            ip: row.get(0)?,
-            events: row.get(1)?,
-            domain: row.get(2).ok(),
+    let rows = stmt
+        .query_map(params_refs.as_slice(), |row| {
+            Ok(IpStats {
+                ip: row.get(0)?,
+                events: row.get(1)?,
+                domain: row.get(2).ok(),
+            })
         })
-    }).map_err(|e| format!("Failed to query IPs: {}", e))?;
+        .map_err(|e| format!("Failed to query IPs: {}", e))?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -7326,7 +7701,7 @@ fn build_ips_query(filter: &ReportFilter, top: usize) -> (String, Vec<String>) {
         "SELECT remote_ip,
                 COUNT(*) as events,
                 domain
-         FROM events WHERE remote_ip IS NOT NULL"
+         FROM events WHERE remote_ip IS NOT NULL",
     );
     let mut params: Vec<String> = Vec::new();
 
@@ -7343,7 +7718,10 @@ fn build_ips_query(filter: &ReportFilter, top: usize) -> (String, Vec<String>) {
         params.push(until.clone());
     }
 
-    sql.push_str(&format!(" GROUP BY remote_ip ORDER BY events DESC LIMIT {}", top));
+    sql.push_str(&format!(
+        " GROUP BY remote_ip ORDER BY events DESC LIMIT {}",
+        top
+    ));
     (sql, params)
 }
 
@@ -7465,7 +7843,12 @@ fn insert_session(conn: &mut Connection, ctx: &RunContext) -> rusqlite::Result<(
     Ok(())
 }
 
-fn finalize_session(conn: &mut Connection, run_id: &str, connects: u64, closes: u64) -> rusqlite::Result<()> {
+fn finalize_session(
+    conn: &mut Connection,
+    run_id: &str,
+    connects: u64,
+    closes: u64,
+) -> rusqlite::Result<()> {
     let end_ts = now_rfc3339();
     conn.execute(
         "UPDATE sessions SET end_ts = ?1, connects = ?2, closes = ?3 WHERE run_id = ?4",
@@ -7723,8 +8106,8 @@ mod tests {
         let config = ProvidersConfig {
             mode: Some("merge".to_string()),
             anthropic: Some(vec!["acme-claude".to_string()]),
-            openai: None,  // Should keep default "codex", "openai"
-            google: None,  // Should keep default "gemini", "google"
+            openai: None, // Should keep default "codex", "openai"
+            google: None, // Should keep default "gemini", "google"
         };
         let mut matcher = ProviderMatcher::default();
         apply_provider_config(&mut matcher, config).expect("config should apply");
@@ -7807,7 +8190,10 @@ mod tests {
             "f(6)".to_string(),
         ];
         let truncated = truncate_ancestry_list(&list);
-        assert_eq!(truncated, vec!["...".to_string(), "e(5)".to_string(), "f(6)".to_string()]);
+        assert_eq!(
+            truncated,
+            vec!["...".to_string(), "e(5)".to_string(), "f(6)".to_string()]
+        );
     }
 
     #[test]
@@ -7958,7 +8344,9 @@ mod tests {
 
         // Verify providers
         let providers: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT DISTINCT provider FROM events ORDER BY provider").unwrap();
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT provider FROM events ORDER BY provider")
+                .unwrap();
             stmt.query_map([], |row| row.get(0))
                 .unwrap()
                 .filter_map(|r| r.ok())
@@ -7979,7 +8367,15 @@ mod tests {
             .query_row(
                 "SELECT ts, event, provider, pid, domain FROM events LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .expect("query failed");
 
@@ -7999,7 +8395,9 @@ mod tests {
         write_sqlite_batch(&mut conn, &batch).expect("batch write failed");
 
         let duration: Option<i64> = conn
-            .query_row("SELECT duration_ms FROM events LIMIT 1", [], |row| row.get(0))
+            .query_row("SELECT duration_ms FROM events LIMIT 1", [], |row| {
+                row.get(0)
+            })
             .expect("query failed");
 
         assert_eq!(duration, Some(1000));
@@ -8010,9 +8408,11 @@ mod tests {
         let mut conn = setup_test_db();
 
         // First batch
-        let batch1 = vec![
-            create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Anthropic),
-        ];
+        let batch1 = vec![create_test_event(
+            "2026-01-20T12:00:00Z",
+            "connect",
+            Provider::Anthropic,
+        )];
         write_sqlite_batch(&mut conn, &batch1).expect("batch1 write failed");
 
         // Second batch
@@ -8039,7 +8439,9 @@ mod tests {
         write_sqlite_batch(&mut conn, &batch).expect("batch write failed");
 
         let distinct_run_ids: i64 = conn
-            .query_row("SELECT COUNT(DISTINCT run_id) FROM events", [], |row| row.get(0))
+            .query_row("SELECT COUNT(DISTINCT run_id) FROM events", [], |row| {
+                row.get(0)
+            })
             .expect("count query failed");
         assert_eq!(distinct_run_ids, 1);
     }
@@ -8135,10 +8537,18 @@ mod tests {
         let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4));
 
         // Domain pattern match should trigger
-        assert!(would_trigger_connection_alert(&config, Some("evil.malicious.com"), ip));
+        assert!(would_trigger_connection_alert(
+            &config,
+            Some("evil.malicious.com"),
+            ip
+        ));
 
         // Non-matching domain should not trigger
-        assert!(!would_trigger_connection_alert(&config, Some("safe.example.com"), ip));
+        assert!(!would_trigger_connection_alert(
+            &config,
+            Some("safe.example.com"),
+            ip
+        ));
 
         // Unknown domain should trigger (when alert_unknown_domain is true)
         assert!(would_trigger_connection_alert(&config, None, ip));
@@ -8192,17 +8602,16 @@ mod tests {
         assert_eq!(state.suppressed_count, 1);
 
         // Different alert type should still emit
-        let sig2 = AlertSignature::MaxPerProvider { provider: Provider::Anthropic };
+        let sig2 = AlertSignature::MaxPerProvider {
+            provider: Provider::Anthropic,
+        };
         assert!(should_emit_alert(&mut state, &sig2, cooldown_ms));
         assert_eq!(state.alert_count, 2);
     }
 
     #[test]
     fn alert_check_domain_patterns() {
-        let patterns = vec![
-            "*.evil.com".to_string(),
-            "malware.*.org".to_string(),
-        ];
+        let patterns = vec!["*.evil.com".to_string(), "malware.*.org".to_string()];
 
         // Match first pattern
         let result = check_domain_patterns(Some("sub.evil.com"), &patterns);
@@ -8232,30 +8641,38 @@ mod tests {
         let mut conn = setup_test_db();
 
         // Create event with alert=true
-        let mut alert_event = create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Unknown);
+        let mut alert_event =
+            create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Unknown);
         alert_event.alert = true;
         alert_event.domain = Some("evil.malicious.com".to_string());
 
         // Create event with alert=false
-        let normal_event = create_test_event("2026-01-20T12:00:01Z", "connect", Provider::Anthropic);
+        let normal_event =
+            create_test_event("2026-01-20T12:00:01Z", "connect", Provider::Anthropic);
 
         let batch = vec![alert_event, normal_event];
         write_sqlite_batch(&mut conn, &batch).expect("batch write failed");
 
         // Query and verify alert flags
         let alert_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM events WHERE alert = 1", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM events WHERE alert = 1", [], |row| {
+                row.get(0)
+            })
             .expect("count query failed");
         assert_eq!(alert_count, 1);
 
         let normal_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM events WHERE alert = 0", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM events WHERE alert = 0", [], |row| {
+                row.get(0)
+            })
             .expect("count query failed");
         assert_eq!(normal_count, 1);
 
         // Verify the alert event has the expected domain
         let alert_domain: String = conn
-            .query_row("SELECT domain FROM events WHERE alert = 1", [], |row| row.get(0))
+            .query_row("SELECT domain FROM events WHERE alert = 1", [], |row| {
+                row.get(0)
+            })
             .expect("domain query failed");
         assert_eq!(alert_domain, "evil.malicious.com");
     }
@@ -8306,7 +8723,10 @@ mod tests {
     #[test]
     fn csv_row_formats_correctly() {
         let values: Vec<(String, FieldValue)> = vec![
-            ("ts".to_string(), FieldValue::String("2026-01-21T12:00:00Z".to_string())),
+            (
+                "ts".to_string(),
+                FieldValue::String("2026-01-21T12:00:00Z".to_string()),
+            ),
             ("pid".to_string(), FieldValue::Integer(1234)),
             ("domain".to_string(), FieldValue::Null),
         ];
@@ -8317,7 +8737,10 @@ mod tests {
     #[test]
     fn jsonl_row_is_valid_json() {
         let values: Vec<(String, FieldValue)> = vec![
-            ("ts".to_string(), FieldValue::String("2026-01-21T12:00:00Z".to_string())),
+            (
+                "ts".to_string(),
+                FieldValue::String("2026-01-21T12:00:00Z".to_string()),
+            ),
             ("pid".to_string(), FieldValue::Integer(1234)),
             ("comm".to_string(), FieldValue::String("test".to_string())),
         ];
@@ -8337,7 +8760,10 @@ mod tests {
     #[test]
     fn jsonl_row_omits_null_values() {
         let values: Vec<(String, FieldValue)> = vec![
-            ("ts".to_string(), FieldValue::String("2026-01-21T12:00:00Z".to_string())),
+            (
+                "ts".to_string(),
+                FieldValue::String("2026-01-21T12:00:00Z".to_string()),
+            ),
             ("domain".to_string(), FieldValue::Null),
             ("pid".to_string(), FieldValue::Integer(42)),
         ];
@@ -8350,9 +8776,10 @@ mod tests {
 
     #[test]
     fn jsonl_row_escapes_special_json_chars() {
-        let values: Vec<(String, FieldValue)> = vec![
-            ("comm".to_string(), FieldValue::String("test\nwith\ttabs".to_string())),
-        ];
+        let values: Vec<(String, FieldValue)> = vec![(
+            "comm".to_string(),
+            FieldValue::String("test\nwith\ttabs".to_string()),
+        )];
         let row = format_jsonl_row(&values);
         // Newlines and tabs must be escaped in JSON
         assert!(row.contains("\\n") || row.contains("\\t") || !row.contains('\t'));
@@ -8438,7 +8865,12 @@ mod tests {
 
     #[test]
     fn validate_fields_accepts_valid_fields() {
-        let fields = vec!["ts".to_string(), "event".to_string(), "provider".to_string(), "domain".to_string()];
+        let fields = vec![
+            "ts".to_string(),
+            "event".to_string(),
+            "provider".to_string(),
+            "domain".to_string(),
+        ];
         assert!(validate_fields(&fields).is_ok());
     }
 
@@ -8468,10 +8900,7 @@ mod tests {
 
     #[test]
     fn format_ancestry_two_processes() {
-        let chain = vec![
-            (1, "init".to_string()),
-            (1234, "myprocess".to_string()),
-        ];
+        let chain = vec![(1, "init".to_string()), (1234, "myprocess".to_string())];
         let result = format_ancestry(&chain);
         assert_eq!(result, "init(1) \u{2192} myprocess(1234)");
     }
@@ -8484,7 +8913,10 @@ mod tests {
             (1234, "myprocess".to_string()),
         ];
         let result = format_ancestry(&chain);
-        assert_eq!(result, "init(1) \u{2192} bash(500) \u{2192} myprocess(1234)");
+        assert_eq!(
+            result,
+            "init(1) \u{2192} bash(500) \u{2192} myprocess(1234)"
+        );
     }
 
     #[test]
@@ -8532,10 +8964,7 @@ mod tests {
 
     #[test]
     fn format_ancestry_list_formats_correctly() {
-        let chain = vec![
-            (1, "init".to_string()),
-            (1234, "claude".to_string()),
-        ];
+        let chain = vec![(1, "init".to_string()), (1234, "claude".to_string())];
         let result = format_ancestry_list(&chain);
         assert_eq!(result, vec!["init(1)", "claude(1234)"]);
     }
@@ -8636,20 +9065,14 @@ mod tests {
     #[test]
     fn format_ancestry_special_chars_in_comm() {
         // Process names with special characters
-        let chain = vec![
-            (1, "init".to_string()),
-            (1234, "my-proc_v2".to_string()),
-        ];
+        let chain = vec![(1, "init".to_string()), (1234, "my-proc_v2".to_string())];
         let result = format_ancestry(&chain);
         assert_eq!(result, "init(1) \u{2192} my-proc_v2(1234)");
     }
 
     #[test]
     fn ancestry_chain_to_path_special_chars_in_comm() {
-        let chain = vec![
-            (1, "init".to_string()),
-            (1234, "my-proc_v2".to_string()),
-        ];
+        let chain = vec![(1, "init".to_string()), (1234, "my-proc_v2".to_string())];
         let result = ancestry_chain_to_path(&chain);
         assert_eq!(result, "init:1,my-proc_v2:1234");
     }
@@ -8670,7 +9093,9 @@ mod tests {
     #[test]
     fn preset_loader_loads_audit_preset() {
         let loader = PresetLoader::new();
-        let values = loader.load_preset("audit").expect("audit preset should exist");
+        let values = loader
+            .load_preset("audit")
+            .expect("audit preset should exist");
         assert_eq!(values.get("summary_only"), Some(&"true".to_string()));
         assert_eq!(values.get("stats_interval_ms"), Some(&"0".to_string()));
     }
@@ -8678,7 +9103,9 @@ mod tests {
     #[test]
     fn preset_loader_loads_quiet_preset() {
         let loader = PresetLoader::new();
-        let values = loader.load_preset("quiet").expect("quiet preset should exist");
+        let values = loader
+            .load_preset("quiet")
+            .expect("quiet preset should exist");
         assert_eq!(values.get("summary_only"), Some(&"true".to_string()));
         assert_eq!(values.get("no_banner"), Some(&"true".to_string()));
     }
@@ -8686,14 +9113,18 @@ mod tests {
     #[test]
     fn preset_loader_loads_live_preset() {
         let loader = PresetLoader::new();
-        let values = loader.load_preset("live").expect("live preset should exist");
+        let values = loader
+            .load_preset("live")
+            .expect("live preset should exist");
         assert_eq!(values.get("stats_interval_ms"), Some(&"2000".to_string()));
     }
 
     #[test]
     fn preset_loader_loads_verbose_preset() {
         let loader = PresetLoader::new();
-        let values = loader.load_preset("verbose").expect("verbose preset should exist");
+        let values = loader
+            .load_preset("verbose")
+            .expect("verbose preset should exist");
         assert_eq!(values.get("include_udp"), Some(&"true".to_string()));
         assert_eq!(values.get("include_listening"), Some(&"true".to_string()));
     }
@@ -8723,7 +9154,10 @@ mod tests {
     fn preset_loader_extracts_description() {
         let loader = PresetLoader::new();
         let presets = loader.list_presets();
-        let audit = presets.iter().find(|p| p.name == "audit").expect("audit preset should exist");
+        let audit = presets
+            .iter()
+            .find(|p| p.name == "audit")
+            .expect("audit preset should exist");
         assert_eq!(audit.description, "Security review / minimal noise");
     }
 
@@ -8731,7 +9165,9 @@ mod tests {
     fn preset_parse_content_handles_empty_lines() {
         let loader = PresetLoader::new();
         let content = "# Comment\n\nkey1=value1\n\n# Another comment\nkey2=value2\n";
-        let values = loader.parse_preset_content(content).expect("parse should succeed");
+        let values = loader
+            .parse_preset_content(content)
+            .expect("parse should succeed");
         assert_eq!(values.get("key1"), Some(&"value1".to_string()));
         assert_eq!(values.get("key2"), Some(&"value2".to_string()));
     }
@@ -8740,7 +9176,9 @@ mod tests {
     fn preset_parse_content_strips_inline_comments() {
         let loader = PresetLoader::new();
         let content = "key1=value1 # inline comment\n";
-        let values = loader.parse_preset_content(content).expect("parse should succeed");
+        let values = loader
+            .parse_preset_content(content)
+            .expect("parse should succeed");
         // Note: current implementation treats everything after # as comment
         // so "value1 " (with trailing space) is the value
         assert!(values.contains_key("key1"));
@@ -8851,7 +9289,10 @@ mod tests {
 
         // This should be treated as first connection after expiry
         let w = tracker.track_connection(ip, port, pid);
-        assert!(w.is_none(), "Connection after window expiry should not trigger warning");
+        assert!(
+            w.is_none(),
+            "Connection after window expiry should not trigger warning"
+        );
     }
 
     #[test]
@@ -8881,7 +9322,10 @@ mod tests {
         tracker.track_connection(ip1, port1, pid2);
         tracker.track_connection(ip1, port1, pid2);
         let w3 = tracker.track_connection(ip1, port1, pid2);
-        assert!(w3.is_some(), "Same endpoint with different PID should trigger at threshold");
+        assert!(
+            w3.is_some(),
+            "Same endpoint with different PID should trigger at threshold"
+        );
         assert_eq!(w3.unwrap().count, 3);
     }
 
@@ -9094,10 +9538,22 @@ mod tests {
             color: true,
             theme: Theme::Vivid,
         };
-        assert_eq!(style.provider_color(Provider::Anthropic), Some(AnsiColor::Magenta));
-        assert_eq!(style.provider_color(Provider::OpenAI), Some(AnsiColor::BrightGreen));
-        assert_eq!(style.provider_color(Provider::Google), Some(AnsiColor::BrightBlue));
-        assert_eq!(style.provider_color(Provider::Unknown), Some(AnsiColor::BrightBlack));
+        assert_eq!(
+            style.provider_color(Provider::Anthropic),
+            Some(AnsiColor::Magenta)
+        );
+        assert_eq!(
+            style.provider_color(Provider::OpenAI),
+            Some(AnsiColor::BrightGreen)
+        );
+        assert_eq!(
+            style.provider_color(Provider::Google),
+            Some(AnsiColor::BrightBlue)
+        );
+        assert_eq!(
+            style.provider_color(Provider::Unknown),
+            Some(AnsiColor::BrightBlack)
+        );
     }
 
     #[test]
@@ -9145,9 +9601,18 @@ mod tests {
     fn test_stats_aggregation_per_domain() {
         let mut stats = Stats::default();
 
-        *stats.per_domain.entry("api.anthropic.com".to_string()).or_insert(0) += 5;
-        *stats.per_domain.entry("api.openai.com".to_string()).or_insert(0) += 3;
-        *stats.per_domain.entry("api.anthropic.com".to_string()).or_insert(0) += 2;
+        *stats
+            .per_domain
+            .entry("api.anthropic.com".to_string())
+            .or_insert(0) += 5;
+        *stats
+            .per_domain
+            .entry("api.openai.com".to_string())
+            .or_insert(0) += 3;
+        *stats
+            .per_domain
+            .entry("api.anthropic.com".to_string())
+            .or_insert(0) += 2;
 
         assert_eq!(stats.per_domain.get("api.anthropic.com"), Some(&7));
         assert_eq!(stats.per_domain.get("api.openai.com"), Some(&3));
@@ -9195,9 +9660,9 @@ mod tests {
         };
         // Each provider should have a distinct symbol
         assert_eq!(style.provider_symbol(Provider::Anthropic), "●"); // Filled circle
-        assert_eq!(style.provider_symbol(Provider::OpenAI), "◆");    // Diamond
-        assert_eq!(style.provider_symbol(Provider::Google), "▲");    // Triangle
-        assert_eq!(style.provider_symbol(Provider::Unknown), "○");   // Empty circle
+        assert_eq!(style.provider_symbol(Provider::OpenAI), "◆"); // Diamond
+        assert_eq!(style.provider_symbol(Provider::Google), "▲"); // Triangle
+        assert_eq!(style.provider_symbol(Provider::Unknown), "○"); // Empty circle
     }
 
     #[test]
@@ -9400,12 +9865,19 @@ mod tests {
 
         // Should be in format: {time}-{provider}-{pattern}-{date}
         let parts: Vec<&str> = name.split('-').collect();
-        assert!(parts.len() >= 4, "Expected at least 4 parts separated by '-', got: {}", name);
+        assert!(
+            parts.len() >= 4,
+            "Expected at least 4 parts separated by '-', got: {}",
+            name
+        );
 
         // First part should be time of day
         let time_parts = ["night", "morning", "afternoon", "evening"];
-        assert!(time_parts.contains(&parts[0]),
-            "Expected time of day (night/morning/afternoon/evening), got: {}", parts[0]);
+        assert!(
+            time_parts.contains(&parts[0]),
+            "Expected time of day (night/morning/afternoon/evening), got: {}",
+            parts[0]
+        );
     }
 
     #[test]
@@ -9413,16 +9885,28 @@ mod tests {
         let patterns = vec!["test".to_string()];
 
         let name_anthropic = generate_session_name(&patterns, Provider::Anthropic);
-        assert!(name_anthropic.contains("-anthropic-"), "Anthropic should have 'anthropic' label");
+        assert!(
+            name_anthropic.contains("-anthropic-"),
+            "Anthropic should have 'anthropic' label"
+        );
 
         let name_openai = generate_session_name(&patterns, Provider::OpenAI);
-        assert!(name_openai.contains("-openai-"), "OpenAI should have 'openai' label");
+        assert!(
+            name_openai.contains("-openai-"),
+            "OpenAI should have 'openai' label"
+        );
 
         let name_google = generate_session_name(&patterns, Provider::Google);
-        assert!(name_google.contains("-google-"), "Google should have 'google' label");
+        assert!(
+            name_google.contains("-google-"),
+            "Google should have 'google' label"
+        );
 
         let name_unknown = generate_session_name(&patterns, Provider::Unknown);
-        assert!(name_unknown.contains("-mixed-"), "Unknown should have 'mixed' label");
+        assert!(
+            name_unknown.contains("-mixed-"),
+            "Unknown should have 'mixed' label"
+        );
     }
 
     #[test]
@@ -9437,7 +9921,10 @@ mod tests {
     fn test_generate_session_name_default_pattern() {
         let patterns: Vec<String> = vec![];
         let name = generate_session_name(&patterns, Provider::Anthropic);
-        assert!(name.contains("-default-"), "Empty patterns should use 'default'");
+        assert!(
+            name.contains("-default-"),
+            "Empty patterns should use 'default'"
+        );
     }
 
     #[test]
@@ -9453,7 +9940,10 @@ mod tests {
 
         // Year should be 4 digits
         assert_eq!(year_part.len(), 4, "Year should be 4 digits");
-        assert!(year_part.chars().all(|c| c.is_ascii_digit()), "Year should be all digits");
+        assert!(
+            year_part.chars().all(|c| c.is_ascii_digit()),
+            "Year should be all digits"
+        );
 
         // Month should be 2 digits
         assert_eq!(month_part.len(), 2, "Month should be 2 digits");
