@@ -1,7 +1,7 @@
 Available presets:
 
   audit        - Security review / minimal noise
-  custom       - Custom test preset (user: /tmp/tmp.WVTuZqXkBh/.config/rano/presets/custom.conf)
+  custom       - Custom test preset (user: /var/folders/_5/807sxxxx3hz62f6qm6ykqjw80000gn/T/tmp.S80GDyR7nE/.config/rano/presets/custom.conf)
   live         - Real-time monitoring focus
   quiet        - Reduce terminal output
   verbose      - Maximum detail
