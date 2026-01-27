@@ -5201,6 +5201,17 @@ fn reverse_dns(ip: IpAddr) -> Option<String> {
         match ip {
             IpAddr::V4(v4) => {
                 let octets = v4.octets();
+                #[cfg(target_os = "macos")]
+                let addr = libc::sockaddr_in {
+                    sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+                    sin_family: libc::AF_INET as u8,
+                    sin_port: 0,
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_be_bytes(octets),
+                    },
+                    sin_zero: [0; 8],
+                };
+                #[cfg(not(target_os = "macos"))]
                 let addr = libc::sockaddr_in {
                     sin_family: libc::AF_INET as u16,
                     sin_port: 0,
@@ -5223,6 +5234,18 @@ fn reverse_dns(ip: IpAddr) -> Option<String> {
                 }
             }
             IpAddr::V6(v6) => {
+                #[cfg(target_os = "macos")]
+                let addr = libc::sockaddr_in6 {
+                    sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
+                    sin6_family: libc::AF_INET6 as u8,
+                    sin6_port: 0,
+                    sin6_flowinfo: 0,
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: v6.octets(),
+                    },
+                    sin6_scope_id: 0,
+                };
+                #[cfg(not(target_os = "macos"))]
                 let addr = libc::sockaddr_in6 {
                     sin6_family: libc::AF_INET6 as u16,
                     sin6_port: 0,
