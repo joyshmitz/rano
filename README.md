@@ -6,8 +6,8 @@
 
 <div align="center">
 
-[![CI](https://github.com/lumera-ai/rano/actions/workflows/ci.yml/badge.svg)](https://github.com/lumera-ai/rano/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/lumera-ai/rano?sort=semver)](https://github.com/lumera-ai/rano/releases)
+[![CI](https://github.com/Dicklesworthstone/rano/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/rano/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Dicklesworthstone/rano?sort=semver)](https://github.com/Dicklesworthstone/rano/releases)
 
 </div>
 
@@ -18,11 +18,11 @@ rano is a **network observer for AI CLI processes** that tracks outbound connect
 ### Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lumera-ai/rano/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.sh | bash
 ```
 
 ```powershell
-irm https://raw.githubusercontent.com/lumera-ai/rano/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.ps1 | iex
 ```
 
 </div>
@@ -101,32 +101,32 @@ sqlite3 observer.sqlite "select * from provider_counts;"
 ### Quick Install (Recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lumera-ai/rano/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.sh | bash
 ```
 
 **With options:**
 
 ```bash
 # Specific version
-curl -fsSL https://raw.githubusercontent.com/lumera-ai/rano/main/install.sh | bash -s -- --version v0.1.0
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.sh | bash -s -- --version v0.1.0
 
 # System-wide (requires sudo)
-curl -fsSL https://raw.githubusercontent.com/lumera-ai/rano/main/install.sh | sudo bash -s -- --system
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.sh | sudo bash -s -- --system
 
 # Auto-update PATH in shell rc files
-curl -fsSL https://raw.githubusercontent.com/lumera-ai/rano/main/install.sh | bash -s -- --easy-mode
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.sh | bash -s -- --easy-mode
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/lumera-ai/rano/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.ps1 | iex
 ```
 
 ### From Source
 
 ```bash
-git clone https://github.com/lumera-ai/rano
+git clone https://github.com/Dicklesworthstone/rano
 cd rano
 cargo build --release
 cp target/release/rano ~/.local/bin/
@@ -135,7 +135,7 @@ cp target/release/rano ~/.local/bin/
 ### Cargo Install
 
 ```bash
-cargo install --git https://github.com/lumera-ai/rano --locked
+cargo install --git https://github.com/Dicklesworthstone/rano --locked
 ```
 
 ---

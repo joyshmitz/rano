@@ -1,7 +1,7 @@
 # rano PowerShell installer
 #
 # Usage:
-#   irm https://raw.githubusercontent.com/lumera-ai/rano/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.ps1 | iex
 #
 # Options:
 #   -Version vX.Y.Z   Install specific version (default: latest)
@@ -12,7 +12,7 @@
 Param(
   [string]$Version = "",
   [string]$Dest = "$HOME\.local\bin",
-  [string]$Owner = "lumera-ai",
+  [string]$Owner = "Dicklesworthstone",
   [string]$Repo = "rano",
   [string]$Checksum = "",
   [string]$ChecksumUrl = "",

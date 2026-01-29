@@ -3,10 +3,10 @@
 # rano installer
 #
 # One-liner install (with cache buster):
-#   curl -fsSL "https://raw.githubusercontent.com/lumera-ai/rano/main/install.sh?$(date +%s)" | bash
+#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.sh?$(date +%s)" | bash
 #
 # Or without cache buster:
-#   curl -fsSL https://raw.githubusercontent.com/lumera-ai/rano/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.sh | bash
 #
 # Options:
 #   --version vX.Y.Z   Install specific version (default: latest)
@@ -23,7 +23,7 @@ umask 022
 shopt -s lastpipe 2>/dev/null || true
 
 VERSION="${VERSION:-}"
-OWNER="${OWNER:-lumera-ai}"
+OWNER="${OWNER:-Dicklesworthstone}"
 REPO="${REPO:-rano}"
 DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"

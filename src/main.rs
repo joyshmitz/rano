@@ -4953,7 +4953,7 @@ fn self_update(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 fn resolve_repo(update: &UpdateCommand) -> Result<(String, String), Box<dyn std::error::Error>> {
-    const DEFAULT_OWNER: &str = "lumera-ai";
+    const DEFAULT_OWNER: &str = "Dicklesworthstone";
     const DEFAULT_REPO: &str = "rano";
 
     if update.owner.is_some() || update.repo.is_some() {
