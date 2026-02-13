@@ -3179,9 +3179,8 @@ fn parse_provider_mode(value: &str) -> Result<ProviderMode, String> {
     }
 }
 
-fn print_help() {
-    println!(
-        "rano - AI CLI network observer\n\n\
+fn top_level_help_text() -> &'static str {
+    "rano - AI CLI network observer\n\n\
 USAGE:\n  rano [options]\n  rano report [options]\n  rano export [options]\n  rano diff --old <id> --new <id> [options]\n  rano status [options]\n  rano config <subcommand>\n  rano update [options]\n\n\
 COMMANDS:\n  report    Query SQLite event history (use --help for details)\n  export    Export SQLite event history\n  diff      Compare two monitoring sessions\n  status    One-line status for shell prompt integration\n  config    Validate and inspect configuration\n  update    Update the rano binary\n\n\
 OPTIONS:\n\
@@ -3243,7 +3242,10 @@ EXAMPLES:\n\
   rano --preset quiet --preset audit                    # Merge presets\n\
   rano --alert-domain '*.evil.com' --alert-max-connections 100\n\
   rano --pattern claude --alert-unknown-domain\n"
-    );
+}
+
+fn print_help() {
+    println!("{}", top_level_help_text());
 }
 
 fn print_update_help() {
@@ -9819,6 +9821,36 @@ mod tests {
         assert!(matches!(parse_theme("mono"), Ok(Theme::Mono)));
         assert!(matches!(parse_theme("colorblind"), Ok(Theme::Colorblind)));
         assert!(parse_theme("invalid").is_err());
+    }
+
+    #[test]
+    fn test_top_level_help_lists_all_subcommands() {
+        let help = top_level_help_text();
+
+        let usage_entries = [
+            "rano report [options]",
+            "rano export [options]",
+            "rano diff --old <id> --new <id> [options]",
+            "rano status [options]",
+            "rano config <subcommand>",
+            "rano update [options]",
+        ];
+        for usage in usage_entries {
+            assert!(
+                help.contains(usage),
+                "top-level help missing usage entry: {}",
+                usage
+            );
+        }
+
+        let command_entries = ["report", "export", "diff", "status", "config", "update"];
+        for command in command_entries {
+            assert!(
+                help.contains(&format!("\n  {}", command)),
+                "top-level help missing command entry: {}",
+                command
+            );
+        }
     }
 
     // Session diff tests
