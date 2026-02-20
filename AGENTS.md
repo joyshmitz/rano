@@ -49,7 +49,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We only use **Cargo** in this project, NEVER any other package manager.
 
-- **Edition:** Rust 2024 (stable toolchain — see `rust-toolchain.toml`)
+- **Edition:** Rust 2024 (nightly toolchain — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Single-crate project (no workspace)
 - **Unsafe code:** Not explicitly forbidden, but avoided where possible
