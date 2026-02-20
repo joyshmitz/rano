@@ -4438,7 +4438,10 @@ fn summary(
     }
 
     if stats.duration_ms_samples > 0 {
-        let avg = stats.duration_ms_total / stats.duration_ms_samples;
+        let avg = stats
+            .duration_ms_total
+            .checked_div(stats.duration_ms_samples)
+            .unwrap_or(0);
         println!(
             "  {} {}ms (max={}ms)",
             paint(
@@ -4548,7 +4551,10 @@ fn format_json_summary(
         false,
     );
     if stats.duration_ms_samples > 0 {
-        let avg = stats.duration_ms_total / stats.duration_ms_samples;
+        let avg = stats
+            .duration_ms_total
+            .checked_div(stats.duration_ms_samples)
+            .unwrap_or(0);
         push_json_num(&mut out, "avg_duration_ms", avg as i64, false);
         push_json_num(
             &mut out,
@@ -4669,11 +4675,10 @@ fn print_provider_stats(stats: &Stats, width: usize, style: OutputStyle) {
         "  active={} peak={} avg_dur={}ms",
         stats.active,
         stats.peak_active,
-        if stats.duration_ms_samples > 0 {
-            stats.duration_ms_total / stats.duration_ms_samples
-        } else {
-            0
-        }
+        stats
+            .duration_ms_total
+            .checked_div(stats.duration_ms_samples)
+            .unwrap_or(0)
     );
 }
 
