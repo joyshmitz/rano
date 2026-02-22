@@ -84,7 +84,7 @@ jobs:
           "$hash  $zipName" | Out-File -Encoding ASCII "$zipName.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: dist/*
@@ -99,7 +99,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
