@@ -5203,7 +5203,7 @@ fn resolve_domain(ip: IpAddr, cache: &mut HashMap<IpAddr, DnsCacheEntry>) -> Opt
 
 fn reverse_dns(ip: IpAddr) -> Option<String> {
     unsafe {
-        let mut host = [0i8; libc::NI_MAXHOST as usize];
+        let mut host = [0 as libc::c_char; libc::NI_MAXHOST as usize];
         let flags = libc::NI_NAMEREQD;
         match ip {
             IpAddr::V4(v4) => {
