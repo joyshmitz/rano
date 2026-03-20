@@ -21,10 +21,6 @@ rano is a **network observer for AI CLI processes** that tracks outbound connect
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.sh | bash
 ```
 
-```powershell
-irm https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.ps1 | iex
-```
-
 </div>
 
 ---
@@ -117,11 +113,13 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.sh | bash -s -- --easy-mode
 ```
 
-### Windows (PowerShell)
+### Windows
 
-```powershell
-irm https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.ps1 | iex
-```
+Windows is not supported. rano relies on Linux-only `/proc` filesystem APIs
+(`/proc/net/tcp`, `/proc/[pid]/fd`, etc.) and Unix libc functions (`getnameinfo`,
+`localtime_r`) that have no Windows equivalents. On Windows, use
+[WSL 2](https://learn.microsoft.com/en-us/windows/wsl/) and install the Linux
+binary inside the WSL environment.
 
 ### From Source
 
@@ -1180,7 +1178,7 @@ Logs:
 
 - **Perfect hostname attribution**: pcap relies on observed DNS/SNI; some flows still resolve via PTR or remain `unknown`.
 - **Packet-level inspection**: it’s not a packet sniffer; use tcpdump/wireshark for payloads.
-- **Windows `/proc` parity**: primary monitoring relies on `/proc`, so non-Linux support is limited.
+- **Windows not supported**: primary monitoring relies on `/proc` and Unix libc APIs; use WSL 2 on Windows.
 
 ---
 
