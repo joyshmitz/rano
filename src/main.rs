@@ -5097,7 +5097,6 @@ fn self_update_unix(
     Ok(())
 }
 
-
 fn shell_escape_posix(input: &str) -> String {
     if input.is_empty() {
         return "''".to_string();
@@ -5110,7 +5109,6 @@ fn shell_escape_posix(input: &str) -> String {
     }
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
-
 
 fn resolve_domain(ip: IpAddr, cache: &mut HashMap<IpAddr, DnsCacheEntry>) -> Option<String> {
     let now = SystemTime::now();
