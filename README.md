@@ -6,7 +6,6 @@
 
 <div align="center">
 
-[![CI](https://github.com/Dicklesworthstone/rano/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/rano/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Dicklesworthstone/rano?sort=semver)](https://github.com/Dicklesworthstone/rano/releases)
 
 </div>
