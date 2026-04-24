@@ -6844,10 +6844,9 @@ fn parse_relative_time(s: &str) -> Option<String> {
         (stripped, "d")
     } else if let Some(stripped) = s.strip_suffix('m') {
         (stripped, "m")
-    } else if let Some(stripped) = s.strip_suffix('w') {
-        (stripped, "w")
     } else {
-        return None;
+        let stripped = s.strip_suffix('w')?;
+        (stripped, "w")
     };
 
     let num: u64 = num_str.parse().ok()?;
